@@ -21,6 +21,9 @@ document.addEventListener('DOMContentLoaded', function () {
     const container = document.getElementById('container');
     nodeSystem.init(container);
 
+    // 启动时把旧版「单一混合收藏夹」按定义结构分流为 MCU 设备 / 外设两个独立收藏夹（仅一次）
+    migrateFavorites();
+
     // 注入 AF 右键菜单管理器（依赖 RichMenu / packages.js）
     nodeSystem.afManager = new AFManager(nodeSystem);
 
@@ -70,6 +73,7 @@ document.addEventListener('DOMContentLoaded', function () {
     const configFileInput = document.getElementById('configFileInput');
     const svdJsonFileInput = document.getElementById('svdJsonFileInput');
     const svdFilesInput = document.getElementById('svdFilesInput');
+    const workspaceFileInput = document.getElementById('workspaceFileInput');
 
     // 加载节点 JSON
     if (fileInput) fileInput.addEventListener('change', (e) => {
@@ -89,7 +93,7 @@ document.addEventListener('DOMContentLoaded', function () {
         fileInput.value = '';
     });
 
-    // 加载「器件收藏夹」JSON（合并进 localStorage 收藏夹）
+    // 加载「外设收藏夹」JSON（按 kind 分流合并进对应 localStorage 收藏夹）
     if (favFileInput) favFileInput.addEventListener('change', (e) => {
         const file = e.target.files[0];
         if (file) {
@@ -97,10 +101,16 @@ document.addEventListener('DOMContentLoaded', function () {
             reader.onload = function (ev) {
                 try {
                     const obj = JSON.parse(ev.target.result);
-                    const cur = loadFavorites();
-                    const merged = Object.assign({}, cur, obj);
-                    saveFavorites(merged);
-                    nodeSystem.updateConnectionStatus('已加载收藏夹', '#38bdf8', `共 ${Object.keys(merged).length} 个收藏器件`);
+                    const mcu = loadFavorites('mcu'), peri = loadFavorites('peripheral');
+                    let count = 0;
+                    Object.keys(obj).forEach(n => {
+                        const d = obj[n];
+                        if (d && d.kind === 'peripheral') { peri[n] = d; }
+                        else { mcu[n] = d; }   // 缺省 / kind==='mcu' 均归 MCU 设备
+                        count++;
+                    });
+                    saveFavorites(mcu, 'mcu'); saveFavorites(peri, 'peripheral');
+                    nodeSystem.updateConnectionStatus('已加载收藏夹', '#38bdf8', `共 ${count} 个收藏器件`);
                     updateFavSelect();
                 } catch (err) {
                     alert('解析收藏夹失败：' + err.message);
@@ -133,7 +143,27 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     });
 
-    // 导入 SVD JSON（{meta, menu}）：存进本地 SVD 库并设为当前
+    // 导入「整个工作区」JSON：写回所有本地配置并就地刷新（面板 + 收藏 + SVD + 接口等）
+    if (workspaceFileInput) workspaceFileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function (ev) {
+                try {
+                    const obj = JSON.parse(ev.target.result);
+                    if (window.applyWorkspace && window.applyWorkspace(obj)) {
+                        nodeSystem.updateConnectionStatus('已导入工作区', '#38bdf8', '整个工作区配置已恢复（面板/收藏/SVD/接口）');
+                    } else {
+                        alert('工作区文件格式不正确');
+                    }
+                } catch (err) {
+                    alert('解析工作区文件失败：' + err.message);
+                }
+                workspaceFileInput.value = '';
+            };
+            reader.readAsText(file);
+        }
+    });
     if (svdJsonFileInput) svdJsonFileInput.addEventListener('change', (e) => {
         const file = e.target.files[0];
         if (file) {
@@ -246,14 +276,351 @@ document.addEventListener('DOMContentLoaded', function () {
     function devMenuCfg() {
         const names = listDevices();
         return {
-            title: '预制设备',
+            title: '设备',
             sections: [
-                { title: '选择设备', controls: [
+                { title: '预制设备', controls: [
                     { type: 'select', id: 'device', label: '设备', value: names[0], options: names.map(n => ({ value: n, label: n })) },
                     { type: 'button', id: 'addDevice', label: '添加设备', onClick: () => { const n = dockMenu.menuControls['device'].value; if (n) nodeSystem.addDevice(n); } }
+                ] },
+                { title: '自定义设备', controls: [
+                    { type: 'button', id: 'newDevice', label: '➕ 添加新设备…', onClick: () => { closeDockMenu(); openDeviceEditorWindow(); } }
                 ] }
             ]
         };
+    }
+
+    // 把结构化引脚转成「每行一个 pin」的多行文本：
+    //   行格式：<标签> [<port>]   —— port 省略时自动从标签推断（如 PA0→port=PA0）
+    function pinsToText(pins) {
+        return (pins || []).map(p => {
+            const label = p.label != null ? p.label : p;
+            const port = p.port != null ? p.port : (typeof label === 'string' && /^P[A-Z]\d+$/.test(label) ? label : '');
+            return port ? `${label} ${port}` : `${label}`;
+        }).join('\n');
+    }
+
+    // 把 AF 表 { "PA0": ["-","SPI1_SCK",...] } 转成多行文本：
+    //   每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，'-' 表示无功能）
+    function afToText(af) {
+        const lines = [];
+        Object.keys(af || {}).forEach(port => {
+            const arr = Array.isArray(af[port]) ? af[port] : [];
+            lines.push([port].concat(arr.map(v => (v == null || v === '' ? '-' : v))).join(' '));
+        });
+        return lines.join('\n');
+    }
+
+    // 把 special 表 { "PA0": ["ADC_IN0","..."] } 转成多行文本：
+    //   每行：<PORT> <功能1> <功能2> ...（空格分隔）
+    function specialToText(special) {
+        const lines = [];
+        Object.keys(special || {}).forEach(port => {
+            const arr = Array.isArray(special[port]) ? special[port] : [special[port]];
+            lines.push([port].concat(arr.filter(v => v != null && v !== '')).join(' '));
+        });
+        return lines.join('\n');
+    }
+
+    // 解析「引脚」多行文本 → [{ label, port }]
+    function parsePinsText(text) {
+        const pins = [];
+        (text || '').split('\n').forEach(raw => {
+            const line = raw.trim();
+            if (!line) return;
+            const parts = line.split(/\s+/);
+            const label = parts[0];
+            let port = parts[1] || null;
+            if (!port && /^P[A-Z]\d+$/.test(label)) port = label;   // 自动推断
+            pins.push(port ? { label, port } : { label });
+        });
+        return pins;
+    }
+
+    // 解析「AF」多行文本 → { "PORT": ["AF0".."AF7"] }
+    function parseAfText(text) {
+        const af = {};
+        (text || '').split('\n').forEach(raw => {
+            const line = raw.trim();
+            if (!line) return;
+            const parts = line.split(/\s+/);
+            const port = parts[0];
+            if (!port) return;
+            const funcs = parts.slice(1).map(v => (v === '-' || v === '' ? '-' : v));
+            while (funcs.length < 8) funcs.push('-');   // 补齐到 8 个 AF
+            af[port] = funcs.slice(0, 8);
+        });
+        return af;
+    }
+
+    // 解析「special」多行文本 → { "PORT": ["功能1","功能2",...] }
+    function parseSpecialText(text) {
+        const special = {};
+        (text || '').split('\n').forEach(raw => {
+            const line = raw.trim();
+            if (!line) return;
+            const parts = line.split(/\s+/);
+            const port = parts[0];
+            if (!port) return;
+            const funcs = parts.slice(1).filter(v => v && v !== '-');
+            if (funcs.length) special[port] = funcs;
+        });
+        return special;
+    }
+
+    // 骨架：直接拿现成预制设备（如 CIU32F003）的完整 JSON 作为编辑起点，
+    // 封装部分完全参考 config 的「mcu.packages」结构：顶层为 MCU 名 + 共享 af/special/gpio，
+    // packages 为多个封装数组（每个含 name/packageType/pins 文本）。
+    // pins / af / special 均为「多行文本」形态（方便用户从手册直接复制粘贴），
+    // 并附 schema 让 RichObjectEditor 用 textarea 渲染；gpio 保持结构化原样。
+    function defaultDeviceSkeleton() {
+        const devices = (window.APP_CONFIG && window.APP_CONFIG.devices) || {};
+        const firstKey = Object.keys(devices)[0];
+        const base = firstKey ? devices[firstKey] : null;
+
+        let data, schema;
+        if (!base) {
+            // 兜底：极端情况下无任何预制设备，退回最小空骨架（纯文本形态，1 个封装）
+            data = {
+                name: 'MyMCU',
+                packages: [
+                    { name: 'SOP16', packageType: 'SOP', pins: 'PA0 PA0\nPA1 PA1\nPB0 PB0\nVSS\nVDD' }
+                ],
+                af: 'PA0 - SPI1_SCK - - - - - -\nPA1 - SPI1_MOSI - - - - - -',
+                special: 'PA0 ADC_IN0\nPA1 ADC_IN1',
+                gpio: {}
+            };
+        } else {
+            const clone = JSON.parse(JSON.stringify(base));
+            delete clone.mcu;   // 运行时归一层字段，自定义设备无需保留
+            // GPIO 复位值转成 16 进制字符串（如 "0x00000000"），让编辑器里直接显示、
+            // 用户复制即用，无需再手动从数字换算；下游读取时按 parseInt(x,16) 兼容字符串/数字。
+            if (clone.gpio && clone.gpio.reset) {
+                const order = ['MODE', 'OTYPE', 'PUPD', 'AFL'];
+                order.forEach(reg => {
+                    const tbl = clone.gpio.reset[reg];
+                    if (tbl && typeof tbl === 'object') {
+                        Object.keys(tbl).forEach(letter => {
+                            const v = tbl[letter];
+                            if (typeof v === 'number') {
+                                tbl[letter] = '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
+                            }
+                        });
+                    }
+                });
+            }
+            // 把单个已摊平 device 反推成「packages」结构（1 个封装）
+            const pkgName = clone.name || firstKey;
+            data = {
+                name: String(pkgName).replace(/\s*\(.*\)\s*$/, '') || pkgName,  // 顶层 MCU 名（去掉括号注释）
+                packages: [
+                    {
+                        name: pkgName,
+                        packageType: clone.packageType || clone.pkg || 'SOP',
+                        pins: pinsToText(clone.pins)
+                    }
+                ],
+                af: afToText(clone.af),
+                special: specialToText(clone.special),
+                gpio: clone.gpio || {}
+            };
+        }
+
+        // schema：让 pins/af/special 用多行文本（textarea）编辑，给出格式提示。
+        // '@pins' 为末级通配：packages 数组里每个元素的 pins 字段都套用相同样式。
+        schema = {
+            '@pins':   { type: 'textarea', rows: 10, placeholder: '每行一个引脚：<标签> [<port>]\n例：PA0 PA0\nVSS（无 port 可省略）' },
+            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，- 表示无）\n例：PA0 - SPI1_SCK - - - - - -' },
+            '["special"]': { type: 'textarea', rows: 6,  placeholder: '每行：<PORT> <功能1> <功能2> ...（空格分隔）\n例：PA0 ADC_IN0' }
+        };
+        return { data, schema };
+    }
+
+    // 把编辑器里的「文本形态」定义解析回 buildCustomDevice 需要的结构化定义
+    function parseDeviceEditorText(def) {
+        const out = JSON.parse(JSON.stringify(def));
+        // 每个封装的 pins 文本 → 结构化 [{label,port}]
+        if (Array.isArray(out.packages)) {
+            out.packages.forEach(pkg => { if (typeof pkg.pins === 'string') pkg.pins = parsePinsText(pkg.pins); });
+        }
+        if (typeof out.af === 'string') out.af = parseAfText(out.af);
+        if (typeof out.special === 'string') out.special = parseSpecialText(out.special);
+        return out;
+    }
+
+    // 打开 MacWindow：内置 RichObjectEditor（预填骨架）+ 添加/删除设备操作
+    function openDeviceEditorWindow(existingDef) {
+        if (typeof MacWindow !== 'function' || typeof RichObjectEditor !== 'function') {
+            alert('设备编辑器依赖 MacWindow / RichObjectEditor，未加载'); return;
+        }
+        // skeleton 形态：{ data, schema }；existingDef 为文本形态的结构化定义（编辑已有收藏时）
+        let skeleton;
+        if (existingDef) {
+            const d = JSON.parse(JSON.stringify(existingDef));
+            if (d.gpio && d.gpio.reset) {
+                ['MODE', 'OTYPE', 'PUPD', 'AFL'].forEach(reg => {
+                    const tbl = d.gpio.reset[reg];
+                    if (tbl && typeof tbl === 'object') {
+                        Object.keys(tbl).forEach(letter => {
+                            const v = tbl[letter];
+                            if (typeof v === 'number') {
+                                tbl[letter] = '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
+                            }
+                        });
+                    }
+                });
+            }
+            skeleton = { data: d, schema: null };
+        } else {
+            skeleton = defaultDeviceSkeleton();
+        }
+        // 若 def 自带文本字段（pins/af/special 为字符串）但无 schema，补上默认文本 schema
+        const editorSchema = skeleton.schema || {
+            '@pins':   { type: 'textarea', rows: 10, placeholder: '每行一个引脚：<标签> [<port>]\n例：PA0 PA0\nVSS（无 port 可省略）' },
+            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，- 表示无）\n例：PA0 - SPI1_SCK - - - - - -' },
+            '["special"]': { type: 'textarea', rows: 6,  placeholder: '每行：<PORT> <功能1> <功能2> ...（空格分隔）\n例：PA0 ADC_IN0' }
+        };
+
+        const win = new MacWindow({
+            title: existingDef ? ('编辑设备 · ' + (existingDef.name || '')) : '新建自定义设备',
+            width: 560, height: 680, dark: true,
+            parent: document.body, resizable: true
+        });
+
+        // 内容容器：上方 ROE（撑满），下方操作条
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex; flex-direction:column; height:100%; min-height:0; background:#0f172a;';
+        const roeHost = document.createElement('div');
+        roeHost.style.cssText = 'flex:1; min-height:0;';
+        const bar = document.createElement('div');
+        bar.style.cssText = 'flex-shrink:0; display:flex; gap:8px; align-items:center; padding:10px 12px; background:#0f172a; border-top:1px solid #334155; flex-wrap:wrap;';
+
+        // 自定义设备显式绑定的 SVD key：'__auto__' 表示按型号自动匹配
+        let currentSvdKey = (existingDef && existingDef.svdKey) ? existingDef.svdKey : '__auto__';
+
+        // SVD 选择下拉（含「自动匹配」选项）
+        const svdSel = document.createElement('select');
+        svdSel.style.cssText = 'background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:5px 8px; font-size:12px; flex:1; min-width:120px;';
+        const refreshSvdSel = () => {
+            const keys = (window.SvdLib && window.SvdLib.listSvdKeys) ? window.SvdLib.listSvdKeys() : [];
+            svdSel.innerHTML = '';
+            const auto = document.createElement('option');
+            auto.value = '__auto__';
+            auto.textContent = '自动匹配 (按型号)';
+            svdSel.appendChild(auto);
+            keys.forEach(k => { const o = document.createElement('option'); o.value = k; o.textContent = k + (window.SvdLib && window.SvdLib.isBuiltin(k) ? '（内置）' : ''); svdSel.appendChild(o); });
+            // 若当前绑定不在列表且非自动，回退到自动
+            svdSel.value = (currentSvdKey === '__auto__' || keys.indexOf(currentSvdKey) !== -1) ? currentSvdKey : '__auto__';
+            if (svdSel.value === '__auto__') currentSvdKey = '__auto__';
+        };
+        refreshSvdSel();
+        const svdHint = document.createElement('span');
+        svdHint.style.cssText = 'font-size:11px; color:#94a3b8; flex-basis:100%;';
+        const updateSvdHint = () => {
+            if (currentSvdKey === '__auto__') {
+                const hit = (window.SvdLib && window.SvdLib.resolveSvdKeyForDevice)
+                    ? window.SvdLib.resolveSvdKeyForDevice({ name: (skeleton && skeleton.data && skeleton.data.name) || '' }) : '';
+                svdHint.textContent = hit ? ('自动匹配将使用: ' + hit) : '自动匹配：当前型号未匹配到 SVD';
+            } else {
+                svdHint.textContent = '已显式绑定 SVD: ' + currentSvdKey;
+            }
+        };
+        updateSvdHint();
+        svdSel.addEventListener('change', () => {
+            currentSvdKey = svdSel.value;
+            updateSvdHint();
+        });
+        bar.appendChild(svdSel);
+        bar.appendChild(svdHint);
+
+        // 收藏夹下拉
+        const favSel = document.createElement('select');
+        favSel.style.cssText = 'background:#1e293b; color:#e2e8f0; border:1px solid #334155; border-radius:4px; padding:5px 8px; font-size:12px; flex:1; min-width:120px;';
+        const refreshFavSel = () => {
+            const favs = loadFavorites('mcu');
+            favSel.innerHTML = '';
+            const ph = document.createElement('option'); ph.value = ''; ph.textContent = '— 收藏夹设备 —'; favSel.appendChild(ph);
+            Object.keys(favs).forEach(n => { const o = document.createElement('option'); o.value = n; o.textContent = n; favSel.appendChild(o); });
+        };
+        refreshFavSel();
+        bar.appendChild(favSel);
+
+        const mkBtn = (label, style, fn) => {
+            const b = document.createElement('button');
+            b.textContent = label;
+            const base = 'padding:6px 12px; border:none; border-radius:5px; cursor:pointer; font-size:12px; color:#0f172a; font-weight:600;';
+            const map = { primary: 'background:#0ea5e9;', secondary: 'background:#475569;color:#e2e8f0;', danger: 'background:#ef4444;color:#fff;', success: 'background:#10b981;' };
+            b.style.cssText = base + (map[style] || map.secondary);
+            b.onclick = fn;
+            return b;
+        };
+
+        bar.appendChild(mkBtn('生成设备', 'primary', () => {
+            const raw = editor.getObj();
+            if (!raw || !raw.name) { alert('请填写设备名称（name）'); return; }
+            if (!Array.isArray(raw.packages) || raw.packages.length === 0) { alert('请至少定义一个封装（packages）'); return; }
+            // 把多行文本形态（每个 package 的 pins / 顶层 af/special 为字符串）解析回结构化定义再生成
+            const def = parseDeviceEditorText(raw);
+            def.svdKey = currentSvdKey;   // 显式绑定 SVD（'__auto__' 表示按型号自动匹配）
+            const ids = nodeSystem.addCustomDeviceSet(def);
+            if (ids && ids.length) {
+                const total = def.packages.reduce((s, p) => s + (p.pins ? p.pins.length : 0), 0);
+                nodeSystem.updateConnectionStatus('已生成自定义设备', '#38bdf8', `设备「${def.name}」已放置 ${ids.length} 个封装（共 ${total} 引脚）`);
+            }
+            try { editor.destroy(); } catch (e) {}
+            win.destroy();
+        }));
+        bar.appendChild(mkBtn('存为收藏', 'success', () => {
+            const def = editor.getObj();
+            if (!def || !def.name) { alert('请填写设备名称（name）'); return; }
+            def.svdKey = currentSvdKey;   // 显式绑定 SVD（'__auto__' 表示按型号自动匹配）
+            def.kind = 'mcu';             // 设备编辑器定义一律归入 MCU 设备收藏夹
+            const favs = loadFavorites('mcu');
+            favs[def.name] = def; saveFavorites(favs, 'mcu');
+            refreshFavSel();
+            nodeSystem.updateConnectionStatus('已加入收藏', '#38bdf8', `设备「${def.name}」已存入收藏夹`);
+        }));
+        bar.appendChild(mkBtn('载入', 'secondary', () => {
+            const name = favSel.value;
+            if (!name) { alert('请先在收藏夹下拉选择设备'); return; }
+            const def = loadFavorites('mcu')[name];
+            if (!def) return;
+            editor.setObj(JSON.parse(JSON.stringify(def)), editorSchema);
+            // 同步该设备显式绑定的 SVD key
+            currentSvdKey = (def && def.svdKey) ? def.svdKey : '__auto__';
+            refreshSvdSel();
+            updateSvdHint();
+        }));
+        bar.appendChild(mkBtn('删除收藏', 'danger', () => {
+            const name = favSel.value;
+            if (!name) { alert('请先在收藏夹下拉选择要删除的设备'); return; }
+            confirmModal('删除收藏', `确定删除收藏「${name}」？此操作不可撤销。`, '删除', '取消').then(ok => {
+                if (!ok) return;
+                const favs = loadFavorites('mcu');
+                delete favs[name]; saveFavorites(favs, 'mcu');
+                refreshFavSel();
+                nodeSystem.updateConnectionStatus('已删除收藏', '#f87171', `设备「${name}」已从收藏夹移除`);
+            });
+        }));
+        bar.appendChild(mkBtn('载入示例', 'secondary', () => { editor.setObj(defaultDeviceSkeleton().data, editorSchema); }));
+
+        wrap.appendChild(roeHost);
+        wrap.appendChild(bar);
+        win.setContent(wrap);
+
+        // 编辑器（放到窗口关闭时一并销毁，避免泄漏）
+        const editor = new RichObjectEditor(roeHost, { hideTypeBadge: false, hideAddRoot: false });
+        editor.setObj(skeleton.data, editorSchema);
+        // 默认展开根 / packages（含首个封装的 pins）/ af / special，方便直接查看
+        editor.expandedPaths.add(JSON.stringify([]));
+        editor.expandedPaths.add(JSON.stringify(['packages']));
+        editor.expandedPaths.add(JSON.stringify(['packages', 0]));
+        editor.expandedPaths.add(JSON.stringify(['packages', 0, 'pins']));
+        editor.expandedPaths.add(JSON.stringify(['af']));
+        editor.expandedPaths.add(JSON.stringify(['special']));
+        editor.renderTree();
+
+        const prevClose = win.onWindowClose;
+        win.onWindowClose = () => { try { editor.destroy(); } catch (e) {} if (typeof prevClose === 'function') prevClose(win); };
     }
 
     function periMenuCfg() {
@@ -261,7 +628,7 @@ document.addEventListener('DOMContentLoaded', function () {
         // 收藏夹下拉：外设 tab 选择即放置；自定义器件 tab 仅回填文本框供编辑（不放置）
         const openFav = (id, value) => {
             if (!value) return;
-            const def = loadFavorites()[value];
+            const def = loadFavorites('peripheral')[value];
             if (!def) return;
             const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['devdef'] : null;
             if (ta) ta.value = defToText(def);
@@ -283,7 +650,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     { type: 'button', id: 'resetLock', label: '重置总线锁定', style: 'secondary',
                         onClick: () => { nodeSystem.busLocks = {}; nodeSystem.updateConnectionStatus('总线锁定已重置', '#38bdf8', '后续外设连线将高亮全部 SPI 实例的 IO'); } },
                     // 收藏夹也放在外设 tab：少一步切换，选择即放置
-                    { type: 'select', id: 'favPeri', label: '收藏夹器件（选择即放置）', value: '', options: favOptions() }
+                    { type: 'select', id: 'favPeri', label: '收藏夹器件（选择即放置）', value: '', options: favOptions('peripheral') }
                 ] },
                 { key: 'custom', title: '【自定义器件】', controls: [
                     { type: 'textarea', id: 'devdef', label: '器件定义（第一行=名称 [封装] [接口名1] …；封装位写 conv=左右直通转换器，生成器件用 SOP 展示；接口名以 @ 开头=强制软件模拟，忽略 & 条件，可用于普通器件；后续每行=引脚 空格分隔 BUS IF）', rows: 8, span: 'full',
@@ -309,16 +676,16 @@ document.addEventListener('DOMContentLoaded', function () {
                         closeDockMenu();
                     } },
                     { type: 'button', id: 'addFav', label: '添加到收藏夹', style: 'secondary', onClick: () => addFavoriteFromText() },
-                    { type: 'select', id: 'favCustom', label: '收藏夹器件（选择即载入文本框，不放置）', value: '', options: favOptions() },
+                    { type: 'select', id: 'favCustom', label: '收藏夹器件（选择即载入文本框，不放置）', value: '', options: favOptions('peripheral') },
                     { type: 'button', id: 'delFav', label: '删除选中收藏', style: 'danger', onClick: () => {
                         const sel = dockMenu.menuControls['favCustom'];
                         const name = sel ? sel.value : '';
                         if (!name) { alert('请先在「收藏夹器件」下拉中选择要删除的器件'); return; }
                         confirmModal('删除收藏', `确定删除收藏「${name}」？此操作不可撤销。`, '删除', '取消').then(ok => {
                             if (!ok) return;
-                            const favs = loadFavorites();
+                            const favs = loadFavorites('peripheral');
                             delete favs[name];
-                            saveFavorites(favs);
+                            saveFavorites(favs, 'peripheral');
                             updateFavSelect();
                             nodeSystem.updateConnectionStatus('已删除收藏', '#f87171', `器件「${name}」已从收藏夹移除`);
                         });
@@ -542,6 +909,11 @@ document.addEventListener('DOMContentLoaded', function () {
                     { type: 'button', id: 'loadFav', label: '加载收藏夹', onClick: () => favFileInput.click() },
                     { type: 'button', id: 'saveFav', label: '导出收藏夹', style: 'secondary', onClick: exportFavorites }
                 ] },
+                { title: '全局工作区（导出/导入整个工作区）', controls: [
+                    { type: 'button', id: 'importWorkspace', label: '导入全局配置', onClick: () => workspaceFileInput.click() },
+                    { type: 'button', id: 'exportWorkspace', label: '导出全局配置', style: 'success', onClick: () => window.exportWorkspace('workspace.json') },
+                    { type: 'heading', label: '包含：应用配置面板、MCU/外设收藏夹、接口初始化/函数面板、SVD 寄存器改动、用户 SVD 库与当前激活型号——相当于导出整个工作区。', span: 'full' }
+                ] },
                 { title: '应用配置（本地存储 · config.json 仅导入导出）', controls: [
                     { type: 'button', id: 'loadCfg', label: '导入 config.json', onClick: () => configFileInput.click() },
                     { type: 'button', id: 'saveCfg', label: '导出 config.json', style: 'secondary', onClick: () => window.exportAppConfig('config.json') },
@@ -593,7 +965,10 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // ============ 自定义器件定义 + 收藏夹（localStorage 持久化） ============
-    const FAV_KEY = 'pinDeviceFavorites';
+    // 自定义 MCU 设备（ROE 编辑器定义，含 gpio/packages）与自定义外设（文本框定义）使用不同收藏夹，
+    // 互不可见、不可混用（主设备与从设备不能混）。
+    const FAV_KEY = 'pinDeviceFavorites';           // MCU 自定义设备
+    const FAV_KEY_PERI = 'pinPeripheralFavorites';  // 自定义外设（文本框定义）
 
     // 解析文本框 → 器件定义。
     // 第一行=名称（可空格分隔多栏）：[名称] [封装] [接口名1] [接口名2] [接口名3] ...
@@ -698,15 +1073,36 @@ document.addEventListener('DOMContentLoaded', function () {
         return lines.join('\n');
     }
 
-    function loadFavorites() {
-        try { return JSON.parse(localStorage.getItem(FAV_KEY) || '{}') || {}; }
+    // kind: 'mcu'（自定义 MCU 设备）/ 'peripheral'（自定义外设）/ 缺省视为 'mcu'
+    function favKeyFor(kind) { return kind === 'peripheral' ? FAV_KEY_PERI : FAV_KEY; }
+    function loadFavorites(kind) {
+        try { return JSON.parse(localStorage.getItem(favKeyFor(kind)) || '{}') || {}; }
         catch (e) { return {}; }
     }
-    function saveFavorites(obj) {
-        try { localStorage.setItem(FAV_KEY, JSON.stringify(obj)); } catch (e) {}
+    function saveFavorites(obj, kind) {
+        try { localStorage.setItem(favKeyFor(kind), JSON.stringify(obj)); } catch (e) {}
+    }
+    // 旧版本只有一个混合收藏夹（pinDeviceFavorites）。启动时按定义结构把条目分流到两个独立收藏夹：
+    //   · 含 packages/gpio → MCU 设备；否则 → 外设。已带 kind 的跳过。仅执行一次。
+    function migrateFavorites() {
+        const raw = (() => { try { return JSON.parse(localStorage.getItem(FAV_KEY) || '{}') || {}; } catch (e) { return {}; } })();
+        if (!Object.keys(raw).length) return;
+        const mcu = {}, peri = {};
+        Object.keys(raw).forEach(n => {
+            const d = raw[n];
+            if (!d || typeof d !== 'object') { mcu[n] = d; return; }
+            if (d.kind === 'peripheral') peri[n] = d;
+            else if (d.kind === 'mcu') mcu[n] = d;
+            else if (d.packages || d.gpio) { d.kind = 'mcu'; mcu[n] = d; }
+            else { d.kind = 'peripheral'; peri[n] = d; }
+        });
+        try {
+            localStorage.setItem(FAV_KEY, JSON.stringify(mcu));
+            localStorage.setItem(FAV_KEY_PERI, JSON.stringify(peri));
+        } catch (e) {}
     }
     // 内置示例：SOP20 自定义器件（带 IO 附加功能：ADC_INx / NRST / EXTCLK），
-    // 用于演示“模拟输入 / GPIO 输出 外设”按附加功能高亮。首次无收藏时自动种入。
+    // 用于演示“模拟输入 / GPIO 输出 外设”按附加功能高亮。首次无收藏时自动种入（归入外设收藏夹）。
     const SOP20_DEF_TEXT = [
         'SOP20',
         'PA5',
@@ -732,24 +1128,24 @@ document.addEventListener('DOMContentLoaded', function () {
     ].join('\n');
     function seedDefaultFavorites() {
         // 内置示例 SOP20 始终以最新定义覆盖（确保“/”内联特殊功能等解析规则生效），不影响用户自建收藏。
-        const favs = loadFavorites();
+        const favs = loadFavorites('peripheral');
         const def = parseDeviceDef(SOP20_DEF_TEXT);
-        if (def) { favs['SOP20'] = def; saveFavorites(favs); }
+        if (def) { def.kind = 'peripheral'; favs['SOP20'] = def; saveFavorites(favs, 'peripheral'); }
     }
-    function favOptions() {
+    function favOptions(kind) {
         seedDefaultFavorites();
-        const favs = loadFavorites();
+        const favs = loadFavorites(kind);
         const opts = [{ value: '', label: '— 选择收藏夹器件 —' }];
         Object.keys(favs).forEach(n => opts.push({ value: n, label: n }));
         return opts;
     }
-    // 动态刷新收藏夹下拉（外设 / 自定义器件 两个 tab 各一份，均刷新）
+    // 动态刷新收藏夹下拉（外设 / 自定义器件 两个 tab 各一份，均为外设收藏夹）
     function updateFavSelect() {
         if (!dockMenu || !dockMenu.menuControls) return;
         ['favPeri', 'favCustom'].forEach(id => {
             const sel = dockMenu.menuControls[id];
             if (!sel || !sel.appendChild) return;
-            const opts = favOptions();
+            const opts = favOptions('peripheral');
             sel.innerHTML = '';
             opts.forEach(o => {
                 const op = document.createElement('option');
@@ -760,8 +1156,72 @@ document.addEventListener('DOMContentLoaded', function () {
     }
     // 供 config.js 的 importAppConfigObject 刷新界面（收藏夹下拉）
     window.refreshFavUI = function () { updateFavSelect(); };
-    // 供 config.js 的 exportAppConfig 收集用户态（当前为收藏夹）
-    window.buildUserConfig = function () { return { favorites: loadFavorites() }; };
+    // 供 config.js 的 importAppConfigObject 在导入后重新分流收藏夹
+    window.migrateFavorites = migrateFavorites;
+    // 供 config.js 的 exportAppConfig 收集用户态（MCU 设备收藏夹 + 外设收藏夹，分开导出）
+    window.buildUserConfig = function () {
+        return { favorites: loadFavorites('mcu'), peripheralFavorites: loadFavorites('peripheral') };
+    };
+    // ============ 全局工作区导出/导入：打包所有本地持久化配置（面板 + 收藏 + SVD + 接口等） ============
+    // 收集当前整个工作区的所有本地存储配置，返回一个结构化对象。
+    function grabLS(key) { try { const s = localStorage.getItem(key); return s == null ? null : JSON.parse(s); } catch (e) { return null; } }
+    function grabLSRaw(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+    window.collectWorkspace = function () {
+        return {
+            _workspace: true,
+            _version: 1,
+            appConfigOverlay: grabLS('pinAppConfigOverlay'),     // 应用配置叠加层（IO 功能库等）
+            mcuFavorites: loadFavorites('mcu'),                   // 自定义 MCU 设备收藏夹
+            peripheralFavorites: loadFavorites('peripheral'),     // 自定义外设收藏夹
+            interfaceInits: grabLS('interfaceInits'),             // 接口初始化参数面板
+            interfaceFunctions: grabLS('interfaceFunctions'),     // 接口函数定义面板
+            svdRegValues: grabLS('svdRegValues'),                 // SVD 寄存器改动值
+            svdLibrary: (window.SvdLib && window.SvdLib.getLibSnapshot) ? window.SvdLib.getLibSnapshot() : grabLS('svdLibrary'), // 用户导入的 SVD 库（可能存于 IndexedDB）
+            svdActiveKey: grabLSRaw(window.SvdLib && window.SvdLib.LS_ACTIVE ? window.SvdLib.LS_ACTIVE : 'svdActiveKey') // 当前激活 SVD
+        };
+    };
+    // 应用（导入）整个工作区配置：写回各 localStorage 键，并就地刷新相关模块（不强制刷新页面）。
+    window.applyWorkspace = function (obj) {
+        if (!obj || typeof obj !== 'object') return false;
+        const putLS = (k, v) => { if (v != null) { try { localStorage.setItem(k, typeof v === 'string' ? v : JSON.stringify(v)); } catch (e) {} } };
+        const LS_LIB = (window.SvdLib && window.SvdLib.LS_LIB) || 'svdLibrary';
+        const LS_ACTIVE = (window.SvdLib && window.SvdLib.LS_ACTIVE) || 'svdActiveKey';
+        putLS('pinAppConfigOverlay', obj.appConfigOverlay);
+        putLS('pinDeviceFavorites', obj.mcuFavorites);
+        putLS('pinPeripheralFavorites', obj.peripheralFavorites);
+        putLS('interfaceInits', obj.interfaceInits);
+        putLS('interfaceFunctions', obj.interfaceFunctions);
+        putLS('svdRegValues', obj.svdRegValues);
+        // SVD 库走 SvdLib 存储层（localStorage 不够时自动落 IndexedDB），不直接写 localStorage
+        if (obj.svdLibrary != null && window.SvdLib && typeof window.SvdLib.setLibSnapshot === 'function') {
+            window.SvdLib.setLibSnapshot(obj.svdLibrary);
+        }
+        if (obj.svdActiveKey != null) putLS(LS_ACTIVE, obj.svdActiveKey);
+        // 重新分流收藏夹（兼容旧混合格式）
+        if (window.migrateFavorites) window.migrateFavorites();
+        // 用户 SVD 库重新合并进全局寄存器库（setLibSnapshot 已写入内存+合并；此处再合并一次确保幂等）
+        if (window.SvdLib && typeof window.SvdLib.mergeFromMem === 'function') window.SvdLib.mergeFromMem();
+        // 接口面板 / 收藏夹 UI 重新从 localStorage 读取
+        if (typeof nodeSystem !== 'undefined' && nodeSystem) {
+            if (nodeSystem.loadInterfaceInits) nodeSystem.loadInterfaceInits();
+            if (nodeSystem.loadInterfaceFunctions) nodeSystem.loadInterfaceFunctions();
+        }
+        if (window.refreshFavUI) window.refreshFavUI();
+        return true;
+    };
+    // 导出整个工作区为 JSON 文件
+    window.exportWorkspace = function (filename) {
+        const data = window.collectWorkspace();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename || 'workspace.json';
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+        if (typeof nodeSystem !== 'undefined' && nodeSystem && nodeSystem.updateConnectionStatus) {
+            nodeSystem.updateConnectionStatus('已导出工作区', '#38bdf8', '整个工作区配置已导出为 ' + (filename || 'workspace.json'));
+        }
+    };
     // 模态确认框（挂在 dock 菜单面板内部，避免点击按钮导致菜单被“外部点击关闭”）。返回 Promise<boolean>。
     function confirmModal(title, message, confirmLabel, cancelLabel) {
         return new Promise((resolve) => {
@@ -826,65 +1286,33 @@ document.addEventListener('DOMContentLoaded', function () {
             catch (err) { alert('右键菜单 JSON 解析失败：' + err.message); return; }
         }
         def.deviceMenu = menuRaw;
-        const favs = loadFavorites();
+        def.kind = 'peripheral';   // 文本框定义一律归入外设收藏夹
+        const favs = loadFavorites('peripheral');
         if (favs[def.name]) {
             // 同名覆盖：用全屏模态确认（替代原生 confirm）
             confirmModal('覆盖收藏', `已存在同名收藏「${def.name}」，是否覆盖？\n确定将用当前定义替换原收藏；取消则不操作。`, '覆盖', '取消').then(ok => {
                 if (!ok) return;
                 favs[def.name] = def;
-                saveFavorites(favs);
+                saveFavorites(favs, 'peripheral');
                 updateFavSelect();
                 nodeSystem.updateConnectionStatus('已覆盖收藏', '#38bdf8', `器件「${def.name}」已更新（${def.pins.length} 引脚）`);
             });
             return;
         }
         favs[def.name] = def;
-        saveFavorites(favs);
+        saveFavorites(favs, 'peripheral');
         updateFavSelect();
         nodeSystem.updateConnectionStatus('已添加到收藏夹', '#38bdf8', `器件「${def.name}」已保存（${def.pins.length} 引脚）`);
     }
-    // 导出收藏夹为 JSON 文件
+    // 导出收藏夹为 JSON 文件（这里导出「外设」收藏夹；MCU 设备随 config.json 导出）
     function exportFavorites() {
-        const json = JSON.stringify(loadFavorites(), null, 2);
+        const json = JSON.stringify(loadFavorites('peripheral'), null, 2);
         const blob = new Blob([json], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url; a.download = 'device-favorites.json';
         document.body.appendChild(a); a.click(); document.body.removeChild(a);
         URL.revokeObjectURL(url);
-    }
-
-    // 寄存器变动值面板：仅输出与复位值不同的 GPIO 寄存器（地址,值,//寄存器名）
-    function regDumpMenuCfg() {
-        const dump = nodeSystem.computeRegisterDump();
-        return {
-            title: '寄存器变动值',
-            width: 380,
-            sections: [
-                { title: '仅列出与复位值不同的寄存器（当前值 ≠ 复位值）', controls: [
-                    { type: 'textarea', id: 'dump', label: '寄存器初始化值',
-                      value: dump || '（无变动：所有 GPIO 寄存器均与复位值一致）',
-                      readonly: true, rows: 12, span: 'full' }
-                ] },
-                { title: '操作', controls: [
-                    { type: 'button', id: 'copy', label: '复制到剪贴板', onClick: () => {
-                        const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dump'] : null;
-                        const text = ta ? ta.value : dump;
-                        if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-                    } },
-                    { type: 'button', id: 'download', label: '下载 .txt', style: 'secondary', onClick: () => {
-                        const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dump'] : null;
-                        const text = ta ? ta.value : dump;
-                        const blob = new Blob([text], { type: 'text/plain' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url; a.download = 'gpio_registers.txt';
-                        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                        URL.revokeObjectURL(url);
-                    } }
-                ] }
-            ]
-        };
     }
 
     // ============ 说明面板（HTML 弹出） ============
@@ -984,12 +1412,41 @@ void {{DEV}}_{{IDX}}_init(void){
     //   两个 section 即两个 Tab —— 【接口初始化定义】写寄存器段、【接口函数定义】写程序段，
     //   两者匹配逻辑一致（外设连到 MCU 某接口时按接口名命中）。Tab 切换由 RichMenu 原地完成，无需重开面板。
     function ifaceInitMenuCfg(anchor) {
+        // 目标 SVD 型号选择器：列出画布上所有 MCU 节点（按其 SVD key），首项为“全局激活 SVD”。
+        // 让接口初始化段在保存/应用时绑定到具体 MCU 类型，避免多 MCU 同画布时串味。
+        const buildSvdTargetOpts = () => {
+            const opts = [{ value: '', label: '— 全局激活 SVD —' }];
+            if (nodeSystem && nodeSystem.nodes) {
+                const seen = new Set();
+                for (const node of nodeSystem.nodes.values()) {
+                    if (node && node.config && node.config.device) {
+                        const k = getNodeSvdKey(node);
+                        if (k && !seen.has(k)) {
+                            seen.add(k);
+                            const label = (node.config.device.name || k) + ' · ' + k;
+                            opts.push({ value: k, label });
+                        }
+                    }
+                }
+            }
+            return opts;
+        };
         const buildNameOpts = (list) => [{ value: '', label: '— 新建 —' }]
             .concat(list.map(d => {
                 const alias = (d.names && d.names.length) ? d.names.join(' ') : '';
-                const lbl = d.name + (alias ? ' （' + alias + '）' : '');
+                // 全局视图下标出归属：无归属=[通用]（可移植到任意型号），有归属=[型号]
+                const own = d.svdKey ? '[' + d.svdKey + '] ' : '[通用] ';
+                const lbl = own + d.name + (alias ? ' （' + alias + '）' : '');
                 return { value: d.name, label: lbl };
             }));
+
+        // 当前面板选中的 SVD 型号（两个 Tab 联动，取任一即可）
+        const currentSvdKey = () => {
+            if (!dockMenu || !dockMenu.menuControls) return '';
+            const a = dockMenu.menuControls['targetSvd'];
+            const b = dockMenu.menuControls['targetSvdFunc'];
+            return (a && a.value) || (b && b.value) || '';
+        };
 
         // 读取当前 textarea 内容（不重开面板）
         const readRaw = (id) => {
@@ -1029,28 +1486,44 @@ void {{DEV}}_{{IDX}}_init(void){
                     const cur = nodeSystem.getInterfaceFunctions().find(d => d.name === value);
                     const v = cur ? nodeSystem.toNewFormatRaw(cur.raw) : (value ? '' : DEFAULT_FUNC_EXAMPLE);
                     if (dockMenu && dockMenu.setValue) dockMenu.setValue('funcRaw', v);
+                } else if (id === 'targetSvd' || id === 'targetSvdFunc') {
+                    // 两个 Tab 的 SVD 型号选择器联动：任一处切换，另一侧同步，避免设置初始化与程序段时型号不一致
+                    const otherId = id === 'targetSvd' ? 'targetSvdFunc' : 'targetSvd';
+                    const other = dockMenu && dockMenu.menuControls ? dockMenu.menuControls[otherId] : null;
+                    if (other && other.value !== value) other.value = value;
+                    // 切换型号后按型号过滤两个定义下拉：
+                    //   选具体型号 → 仅显示“通用定义 + 该型号定义”；选全局 → 显示全部（便于对照/移植）
+                    refreshSelect('sel', nodeSystem.getInterfaceInitsForSvd(value));
+                    refreshSelect('funcSel', nodeSystem.getInterfaceFunctionsForSvd(value));
                 }
             },
             sections: [
                 {
                     key: 'init',
                     title: '【接口初始化定义】',
+                    // 混合布局：整体保持纵向（heading/下拉/文本域各自占整行更易读），
+                    // 仅用控件上的 row 标记把成对按钮收成一行，无需整块 grid。
                     controls: [
-                        { type: 'heading', label: '格式：第 1 行=名称（便于管理，如 “通用SPI”）；第 2 行=接口别名（空格分隔，如 “SPI1_CLK SPI1_MOSI SPI1_MISO”），任一被连接即应用整组初始化；第 3 行起=“地址,值”（行尾 // 注释可保留）。别名前加 “&” 表示“必需条件”：所有 & 别名都被连接才生成（如 “&SPI1_CLK &SPI1_MOSI &SPI1_MISO”）；不带 & 的“任一命中即可”；两者可混用。相同地址自动 | 合并。' },
+                        { type: 'heading', label: '格式：第 1 行=名称（便于管理，如 “通用SPI”）；第 2 行=接口别名（空格分隔，如 “SPI1_CLK SPI1_MOSI SPI1_MISO”），任一被连接即应用整组初始化；第 3 行起=“地址,值”（行尾 // 注释可保留）。别名前加 “&” 表示“必需条件”：所有 & 别名都被连接才生成（如 “&SPI1_CLK &SPI1_MOSI &SPI1_MISO”）；不带 & 的“任一命中即可”；两者可混用。相同地址自动 | 合并。', span: 'full' },
                         { type: 'select', id: 'sel', label: '已定义接口', value: '', options: buildNameOpts(initList), span: 'full' },
                         { type: 'textarea', id: 'raw', label: '定义', value: DEFAULT_IFACE_EXAMPLE, rows: 11, span: 'full' },
-                        { type: 'button', id: 'saveSvd', label: '保存到SVD', style: 'primary', onClick: () => {
-                            const res = nodeSystem.applyInterfaceInitToSvd(readRaw('raw'));
+                        { type: 'select', id: 'targetSvd', label: '目标 SVD 型号（保存到该 MCU 的寄存器空间并按型号过滤定义列表：选型号=通用+该型号，选全局=全部；与「接口函数」联动）', value: '', options: buildSvdTargetOpts(), span: 'full' },
+                        { type: 'button', id: 'saveSvd', label: '保存到所选SVD', style: 'primary', row: 'svdOps', onClick: () => {
+                            const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['targetSvd'] : null;
+                            const sk = (sel && sel.value) || (window.SvdLib && window.SvdLib.getActiveSvdKey()) || '';
+                            const res = nodeSystem.applyInterfaceInitToSvd(readRaw('raw'), sk);
                             if (!res.ok) { alert(res.msg); return; }
                             // 实时更新：applyInterfaceInitToSvd 已触发 onRegistersChanged，
                             // SVD 窗口若打开可见将自动刷新，无需弹窗提示
                         } },
-                        { type: 'button', id: 'loadSvd', label: '从SVD加载', style: 'secondary', onClick: () => {
-                            const res = nodeSystem.loadInterfaceInitFromSvd(readRaw('raw'));
+                        { type: 'button', id: 'loadSvd', label: '从所选SVD加载', style: 'secondary', row: 'svdOps', onClick: () => {
+                            const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['targetSvd'] : null;
+                            const sk = (sel && sel.value) || (window.SvdLib && window.SvdLib.getActiveSvdKey()) || '';
+                            const res = nodeSystem.loadInterfaceInitFromSvd(readRaw('raw'), sk);
                             if (!res.ok) { alert(res.msg); return; }
                             if (dockMenu && dockMenu.setValue) dockMenu.setValue('raw', res.raw);
                         } },
-                        { type: 'button', id: 'save', label: '保存', onClick: () => {
+                        { type: 'button', id: 'save', label: '保存', row: 'defOps', onClick: () => {
                             const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['sel'] : null;
                             const oldName = sel ? sel.value : '';
                             const txt = readRaw('raw');
@@ -1058,23 +1531,22 @@ void {{DEV}}_{{IDX}}_init(void){
                             if (!r.name) { alert('第 1 行必须为名称（如 通用SPI）'); return; }
                             // 改名时删除旧名定义，避免残留
                             if (oldName && oldName !== r.name) nodeSystem.deleteInterfaceInit(oldName);
-                            nodeSystem.upsertInterfaceInit(r.name, txt);
-                            refreshSelect('sel', nodeSystem.getInterfaceInits());
+                            // 归属所选型号；选“全局”则存为通用定义（任意型号可见，便于移植）
+                            const sk = currentSvdKey();
+                            nodeSystem.upsertInterfaceInit(r.name, txt, sk);
+                            refreshSelect('sel', nodeSystem.getInterfaceInitsForSvd(sk));
                             if (sel) sel.value = r.name;
                             // 定义新增/修改后，立即按当前连接重算接口初始化，使已连好的器件即时生效
                             nodeSystem.recomputeInterfaceInitRegisters();
                         } },
-                        { type: 'button', id: 'del', label: '删除选中', style: 'danger', onClick: () => {
+                        { type: 'button', id: 'del', label: '删除选中', style: 'danger', row: 'defOps', onClick: () => {
                             const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['sel'] : null;
                             const name = sel ? sel.value : '';
                             if (!name) return;
                             nodeSystem.deleteInterfaceInit(name);
-                            refreshSelect('sel', nodeSystem.getInterfaceInits());
+                            refreshSelect('sel', nodeSystem.getInterfaceInitsForSvd(currentSvdKey()));
                             if (dockMenu && dockMenu.setValue) dockMenu.setValue('raw', DEFAULT_IFACE_EXAMPLE);
                             // 删除定义后，立即重算以清除已被删除定义写入的寄存器
-                            nodeSystem.recomputeInterfaceInitRegisters();
-                        } },
-                        { type: 'button', id: 'apply', label: '应用到当前连接', style: 'secondary', span: 'full', onClick: () => {
                             nodeSystem.recomputeInterfaceInitRegisters();
                         } }
                     ]
@@ -1082,34 +1554,35 @@ void {{DEV}}_{{IDX}}_init(void){
                 {
                     key: 'func',
                     title: '【接口函数定义】',
+                    // 混合布局：同 init 段，仅成对按钮经 row 并排
                     controls: [
-                        { type: 'heading', label: '逻辑同接口初始化：第 1 行=名称，第 2 行=接口别名（可带 & 条件），第 3 行起=函数代码（原样保留，可含空行/注释/大括号）。连上对应接口(满足 & 条件)后，代码被收集并在「💻 程序段」栏整段导出。' },
+                        { type: 'heading', label: '逻辑同接口初始化：第 1 行=名称，第 2 行=接口别名（可带 & 条件），第 3 行起=函数代码（原样保留，可含空行/注释/大括号）。连上对应接口(满足 & 条件)后，代码被收集并在「💻 程序段」栏整段导出。', span: 'full' },
                         { type: 'select', id: 'funcSel', label: '已定义函数', value: '', options: buildNameOpts(funcList), span: 'full' },
                         { type: 'textarea', id: 'funcRaw', label: '定义', value: DEFAULT_FUNC_EXAMPLE, rows: 13, span: 'full' },
-                        { type: 'button', id: 'saveFunc', label: '保存', style: 'primary', onClick: () => {
+                        { type: 'select', id: 'targetSvdFunc', label: '目标 SVD 型号（按型号过滤定义列表：选型号=通用+该型号，选全局=全部；导出程序段时仅含该 MCU 触发的函数；与「接口初始化」联动）', value: '', options: buildSvdTargetOpts(), span: 'full' },
+                        { type: 'button', id: 'saveFunc', label: '保存', style: 'primary', row: 'funcOps', onClick: () => {
                             const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['funcSel'] : null;
                             const oldName = sel ? sel.value : '';
                             const txt = readRaw('funcRaw');
                             const r = nodeSystem.parseInterfaceFunction(txt);
                             if (!r.name) { alert('第 1 行必须为名称（如 通用SPI读写）'); return; }
                             if (oldName && oldName !== r.name) nodeSystem.deleteInterfaceFunction(oldName);
-                            nodeSystem.upsertInterfaceFunction(r.name, txt);
-                            refreshSelect('funcSel', nodeSystem.getInterfaceFunctions());
+                            // 归属所选型号；选“全局”则存为通用定义（任意型号可见，便于移植）
+                            const sk = currentSvdKey();
+                            nodeSystem.upsertInterfaceFunction(r.name, txt, sk);
+                            refreshSelect('funcSel', nodeSystem.getInterfaceFunctionsForSvd(sk));
                             if (sel) sel.value = r.name;
                             // 函数定义新增/修改后，立即按当前连接重算，使已连好的器件即时收集到函数段
                             nodeSystem.recomputeInterfaceInitRegisters();
                         } },
-                        { type: 'button', id: 'delFunc', label: '删除选中', style: 'danger', onClick: () => {
+                        { type: 'button', id: 'delFunc', label: '删除选中', style: 'danger', row: 'funcOps', onClick: () => {
                             const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['funcSel'] : null;
                             const name = sel ? sel.value : '';
                             if (!name) return;
                             nodeSystem.deleteInterfaceFunction(name);
-                            refreshSelect('funcSel', nodeSystem.getInterfaceFunctions());
+                            refreshSelect('funcSel', nodeSystem.getInterfaceFunctionsForSvd(currentSvdKey()));
                             if (dockMenu && dockMenu.setValue) dockMenu.setValue('funcRaw', DEFAULT_FUNC_EXAMPLE);
                             // 删除函数定义后，立即重算以清除已被删除定义收集的函数段
-                            nodeSystem.recomputeInterfaceInitRegisters();
-                        } },
-                        { type: 'button', id: 'applyFunc', label: '应用到当前连接', style: 'secondary', span: 'full', onClick: () => {
                             nodeSystem.recomputeInterfaceInitRegisters();
                         } }
                     ]
@@ -1155,15 +1628,22 @@ void {{DEV}}_{{IDX}}_init(void){
     function editorSvdKey() {
         return window.__svdActiveKey || (window.SvdLib && window.SvdLib.getActiveSvdKey()) || '';
     }
-    // 取某节点（MCU / 自定义器件）对应的 SVD key：MCU 按大类名称自动匹配（封装继承同一 SVD）；自定义器件取所连 MCU 的 SVD
+    // 取某节点（MCU / 自定义器件）对应的 SVD key：优先用 device 显式绑定的 svdKey（'__auto__' 则按型号自动匹配）；
+    // 其次按大类名称自动匹配（封装继承同一 SVD）；自定义器件取所连 MCU 的 SVD
     function getNodeSvdKey(node) {
+        const resolveFromDev = (dev) => {
+            if (!dev) return '';
+            if (dev.svdKey && dev.svdKey !== '__auto__') return dev.svdKey;
+            if (window.SvdLib && window.SvdLib.resolveSvdKeyForDevice) return window.SvdLib.resolveSvdKeyForDevice(dev);
+            return '';
+        };
         if (node && node.config && node.config.device) {
-            const k = window.SvdLib && window.SvdLib.resolveSvdKeyForDevice(node.config.device);
+            const k = resolveFromDev(node.config.device);
             if (k) return k;
         }
         const mcu = (typeof findDeviceTimChannel === 'function') ? findDeviceTimChannel(node) : null;
         if (mcu && mcu.config && mcu.config.device) {
-            const k = window.SvdLib && window.SvdLib.resolveSvdKeyForDevice(mcu.config.device);
+            const k = resolveFromDev(mcu.config.device);
             if (k) return k;
         }
         return editorSvdKey();
@@ -1446,60 +1926,116 @@ void {{DEV}}_{{IDX}}_init(void){
         window.__svdEditor = editor;
         applySvdModel(editor);
     }
-    // ============ 接口程序段输出（已使用接口的函数代码整段导出） ============
-    function funcCodeMenuCfg(anchor) {
-        const dump = nodeSystem.computeFunctionDump();
+
+    // ============ 寄存器变动值 + 接口程序段输出（合并为 tabs 布局） ============
+    function regFuncMenuCfg(anchor) {
+        // 目标 SVD 型号：列表画布上所有 MCU 节点（按其 SVD key），首项为“全局”
+        const buildSvdTargetOptsForDump = () => {
+            const opts = [{ value: '', label: '— 全部 MCU —' }];
+            if (nodeSystem && nodeSystem.nodes) {
+                const seen = new Set();
+                for (const node of nodeSystem.nodes.values()) {
+                    if (node && node.config && node.config.device) {
+                        const k = getNodeSvdKey(node);
+                        if (k && !seen.has(k)) {
+                            seen.add(k);
+                            opts.push({ value: k, label: (node.config.device.name || k) + ' · ' + k });
+                        }
+                    }
+                }
+            }
+            return opts;
+        };
+        const regDump = nodeSystem.computeRegisterDump();
+        const funcDump = nodeSystem.computeFunctionDump();
         return {
-            title: '接口程序段输出',
+            title: '寄存器变动值 / 程序段输出',
             width: 460,
+            layout: 'tabs',
             sections: [
-                { title: '已使用接口的初始化函数代码（连上对应接口即收集，可整段贴进固件）', controls: [
-                    { type: 'textarea', id: 'code', label: '程序段', value: dump, readonly: true, rows: 14, span: 'full' }
-                ] },
-                { title: '操作', layout: 'grid', controls: [
-                    { type: 'button', id: 'refresh', label: '重新收集', style: 'primary', onClick: () => {
-                        nodeSystem.recomputeInterfaceInitRegisters();
-                        openDockMenu(anchor, funcCodeMenuCfg(anchor));
-                    } },
-                    { type: 'button', id: 'copy', label: '复制到剪贴板', style: 'secondary', onClick: () => {
-                        const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['code'] : null;
-                        const text = ta ? ta.value : dump;
-                        if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-                    } },
-                    { type: 'button', id: 'download', label: '下载 .c', style: 'secondary', onClick: () => {
-                        const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['code'] : null;
-                        const text = ta ? ta.value : dump;
-                        const blob = new Blob([text], { type: 'text/plain' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url; a.download = 'interface_funcs.c';
-                        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-                        URL.revokeObjectURL(url);
-                    } }
-                ] }
+                {
+                    key: 'reg',
+                    title: '寄存器变动值',
+                    controls: [
+                        { type: 'textarea', id: 'dump', label: '寄存器初始化值（仅列出与复位值不同的寄存器）',
+                          value: regDump || '（无变动：所有 GPIO 寄存器均与复位值一致）',
+                          readonly: true, rows: 12, span: 'full' },
+                        { type: 'button', id: 'regCopy', label: '复制到剪贴板', style: 'primary', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dump'] : null;
+                            const text = ta ? ta.value : regDump;
+                            if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+                        } },
+                        { type: 'button', id: 'regDownload', label: '下载 .txt', style: 'secondary', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dump'] : null;
+                            const text = ta ? ta.value : regDump;
+                            const blob = new Blob([text], { type: 'text/plain' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url; a.download = 'gpio_registers.txt';
+                            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                        } }
+                    ]
+                },
+                {
+                    key: 'func',
+                    title: '程序段输出',
+                    controls: [
+                        { type: 'select', id: 'dumpSvd', label: '仅导出该型号 MCU 触发的函数', value: '', options: buildSvdTargetOptsForDump(), span: 'full' },
+                        { type: 'textarea', id: 'code', label: '程序段', value: funcDump, readonly: true, rows: 12, span: 'full' },
+                        { type: 'button', id: 'funcRefresh', label: '重新收集', style: 'primary', onClick: () => {
+                            nodeSystem.recomputeInterfaceInitRegisters();
+                            const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dumpSvd'] : null;
+                            const sk = sel ? sel.value : '';
+                            openDockMenu(anchor, regFuncMenuCfg(anchor));
+                            if (sk) { const s2 = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dumpSvd'] : null; if (s2) s2.value = sk; }
+                        } },
+                        { type: 'button', id: 'funcFilter', label: '按型号过滤', style: 'secondary', onClick: () => {
+                            const sel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dumpSvd'] : null;
+                            const sk = sel ? sel.value : '';
+                            nodeSystem.recomputeInterfaceInitRegisters();
+                            const filtered = nodeSystem.computeFunctionDump(sk);
+                            if (dockMenu && dockMenu.setValue) dockMenu.setValue('code', filtered);
+                        } },
+                        { type: 'button', id: 'funcCopy', label: '复制到剪贴板', style: 'secondary', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['code'] : null;
+                            const text = ta ? ta.value : funcDump;
+                            if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+                        } },
+                        { type: 'button', id: 'funcDownload', label: '下载 .c', style: 'secondary', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['code'] : null;
+                            const text = ta ? ta.value : funcDump;
+                            const blob = new Blob([text], { type: 'text/plain' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url; a.download = 'interface_funcs.c';
+                            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                        } }
+                    ]
+                }
             ]
         };
     }
 
     // ============ 构建顶部 Dock 栏 ============
     const dockItems = [
-        { emoji: '📦', app: '封装', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], pkgMenuCfg()) },
-        { emoji: '🔌', app: '设备', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], devMenuCfg()) },
-        { emoji: '💾', app: '外设', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], periMenuCfg()) },
+        { emoji: '🎛️', app: '设备', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], devMenuCfg()) },
+        { emoji: '🔧', app: '外设', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], periMenuCfg()) },
         { emoji: '🎨', app: '画布', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], canvasMenuCfg()) },
-        { emoji: '📁', app: '配置', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], configMenuCfg()) },
-        { emoji: '📊', app: '寄存器', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], regDumpMenuCfg()) },
+        { emoji: '⚙️', app: '配置', callback: (dock, index) => openDockMenu(dock.dock.querySelectorAll('.dock-item')[index], configMenuCfg()) },
+        { emoji: '🧰', app: '接口初始化', callback: (dock, index) => { const a = dock.dock.querySelectorAll('.dock-item')[index]; openDockMenu(a, ifaceInitMenuCfg(a)); } },
+        { emoji: '🧩', app: '寄存器/程序段', callback: (dock, index) => { const a = dock.dock.querySelectorAll('.dock-item')[index]; openDockMenu(a, regFuncMenuCfg(a)); } },
         { emoji: '📑', app: 'SVD', callback: () => openSvdWindow() },
-        { emoji: '⚙️', app: '接口初始化', callback: (dock, index) => { const a = dock.dock.querySelectorAll('.dock-item')[index]; openDockMenu(a, ifaceInitMenuCfg(a)); } },
-        { emoji: '💻', app: '程序段', callback: (dock, index) => { const a = dock.dock.querySelectorAll('.dock-item')[index]; openDockMenu(a, funcCodeMenuCfg(a)); } },
-        { emoji: '📖', app: '说明', callback: (dock, index) => toggleHelp(dock.dock.querySelectorAll('.dock-item')[index]) },
-        { emoji: '🖥️', app: '全屏', callback: () => toggleFullscreen() }
+        { emoji: '❓', app: '说明', callback: (dock, index) => toggleHelp(dock.dock.querySelectorAll('.dock-item')[index]) },
+        { emoji: '🖥️', app: '面板', callback: () => { if (window.openPanelMenu) window.openPanelMenu(); } },
+        { emoji: '📡', app: '通讯', callback: () => openCommWindow() }
     ];
 
     const dockHost = document.getElementById('dockHost');
     if (dockHost && typeof MacOSDock === 'function') {
-        // eslint-disable-next-line no-new
-        new MacOSDock(dockHost, dockItems, { position: 'top', scaleFactor: 0.5 });
+        // 暴露全局 dock 实例，供其它模块（如面板工作台）追加图标
+        window.__dock = new MacOSDock(dockHost, dockItems, { position: 'top', scaleFactor: 0.5 });
     }
     } // end boot()
 

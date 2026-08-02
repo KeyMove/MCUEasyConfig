@@ -20,6 +20,10 @@ class RichObjectEditor {
         this.highlightOnClick = !!options.highlightOnClick;
         this.hideAddRoot = !!options.hideAddRoot;
         this.editableKey = options.editableKey !== false; // 默认可双击改名
+        // 「推送到布局窗口」：开启后每个叶子节点右侧出现 ➡ 按钮，
+        // 点击时把该节点的控件定义（path + schema + 当前值）推给回调。
+        this.onPushControl = options.onPushControl || null;
+        this.enablePush = !!options.onPushControl;
 
         // 搜索
         this.searchCache = new Map();
@@ -83,10 +87,45 @@ class RichObjectEditor {
 
     getObj() { return this.data; }
 
+    /** 销毁编辑器：移除已挂到 body 上的模态框，避免泄漏 */
+    destroy() {
+        if (this._modals) this._modals.forEach(m => m.remove());
+        this._modals = [];
+        if (this.container) this.container.innerHTML = '';
+    }
+
     getSchema() {
         const out = {};
         this.schema.forEach((v, k) => { out[k] = v; });
         return out;
+    }
+
+    /**
+     * 按路径取 schema 定义，支持两种键：
+     *   - 精确路径：JSON.stringify(path)，如 '["pins"]'
+     *   - 末级字段名通配：'@<key>'，匹配任意路径下名为 <key> 的叶子
+     *     （用于动态数组/对象里同名子字段统一样式，如 packages[].pins）
+     * 精确优先，通配兜底。
+     */
+    getSchemaForPath(pathStr) {
+        const exact = this.schema.get(pathStr);
+        if (exact) return exact;
+        let last = null;
+        try {
+            const path = JSON.parse(pathStr);
+            last = path[path.length - 1];
+            if (last !== undefined && last !== null) {
+                const wild = this.schema.get('@' + String(last));
+                if (wild) return wild;
+            }
+        } catch (e) { /* pathStr 不是合法 JSON 路径（如裸字段名）时忽略 */ }
+        // 兜底：部分导出/手写 schema 可能直接用裸字段名做 key（如 "pins"），
+        // 此时按末级字段名做精确字符串匹配，保证控件类型能被还原。
+        if (last !== null && last !== undefined) {
+            const bare = this.schema.get(String(last));
+            if (bare) return bare;
+        }
+        return null;
     }
 
     /** 从平面对象加载 schema: { "pathStr": { type, label, ... } } */
@@ -108,6 +147,74 @@ class RichObjectEditor {
     _notifyChange() {
         if (this.onChangeCallback) this.onChangeCallback(this.data, this.getSchema(), this._lastChangedPath);
         this._lastChangedPath = null;
+    }
+
+    /**
+     * 把某个节点转换成「控件定义 (ControlDef)」并推送给布局窗口。
+     * 这是 定义控件 -> 布局 的桥梁：编辑器里定义好控件长什么样，
+     * 一键推过去，由布局窗口负责摆放位置。
+     * @param {Array} path 节点路径
+     * @returns {Object|null} 生成的 ControlDef
+     */
+    pushControl(path) {
+        const pathStr = JSON.stringify(path);
+        const def = this.buildControlDef(path);
+        if (!def) return null;
+        if (this.onPushControl) this.onPushControl(def, pathStr, this);
+        return def;
+    }
+
+    /** 根据节点的 schema + 当前值，构造一个 ControlDef（不含位置信息） */
+    buildControlDef(path) {
+        if (!path || path.length === 0) return null;
+        const pathStr = JSON.stringify(path);
+        const value = this._getByPath(path);
+        const dtype = this.getType(value);
+        if (dtype === 'object' || dtype === 'array') return null;
+
+        const s = this.getSchemaForPath(pathStr) || {};
+        // schema 为 auto / 缺省时，按数据类型推断控件
+        let type = s.type && s.type !== 'auto' ? s.type : null;
+        if (!type) {
+            if (dtype === 'number') type = 'number';
+            else if (dtype === 'boolean') type = 'checkbox';
+            else type = 'text';
+        }
+
+        const key = String(path[path.length - 1]);
+        const def = {
+            // 用 path 序列化做稳定且唯一的 id：encodeURIComponent 保留中文与符号，
+            // 再用少量替换去掉不允许出现在 DOM id 里的字符，保证不同节点 id 不碰撞。
+            id: 'ctl_' + pathStr.replace(/[^A-Za-z0-9]/g, c => '_' + c.charCodeAt(0).toString(16) + '_'),
+            srcPath: pathStr,                       // 回溯到编辑器节点，便于双向同步
+            type,
+            label: s.label || s.keyAlias || key,
+            // 优先用 schema 里配置的「值」（按钮=点击写入值 / 标签=显示文本），
+            // 回退到节点本身的 data 值。注意 schema.value 与 data 值分开存，不能丢掉配置。
+            value: s.value !== undefined ? s.value : value,
+            cell: s.cell || null,                   // 关联的 Excel 单元格（可在 schema 里配置）
+        };
+        ['min', 'max', 'step', 'unit', 'placeholder', 'options', 'rows'].forEach(k => {
+            if (s[k] !== undefined) def[k] = s[k];
+        });
+        return def;
+    }
+
+    /** 批量推送：把所有已配置 schema 的叶子节点一次性推过去 */
+    pushAllControls() {
+        const out = [];
+        const dfs = (obj, path) => {
+            if (obj === null || typeof obj !== 'object') return;
+            const entries = Array.isArray(obj) ? obj.map((v, i) => [i, v]) : Object.entries(obj);
+            entries.forEach(([k, v]) => {
+                const cur = [...path, k];
+                if (v !== null && typeof v === 'object') { dfs(v, cur); return; }
+                const d = this.pushControl(cur);
+                if (d) out.push(d);
+            });
+        };
+        dfs(this.data, []);
+        return out;
     }
 
     // ==================== 样式注入 ====================
@@ -380,29 +487,60 @@ class RichObjectEditor {
     </div>
 </div>`;
 
+        const $ = (id) => this._$(id);
         this.dom = {
-            treeRoot: document.getElementById('roe-tree-root'),
-            stats: document.getElementById('roe-stats'),
-            searchWrapper: document.getElementById('roe-search-wrapper'),
-            searchInput: document.getElementById('roe-search'),
-            dropdown: document.getElementById('roe-dropdown'),
-            modalOverlay: document.getElementById('roe-modal-overlay'),
-            modalTitle: document.getElementById('roe-modal-title'),
-            modalKey: document.getElementById('roe-modal-key'),
-            modalType: document.getElementById('roe-modal-type'),
-            modalValue: document.getElementById('roe-modal-value'),
-            modalValRow: document.getElementById('roe-modal-val-row'),
-            jsonModalOverlay: document.getElementById('roe-json-modal-overlay'),
-            jsonInput: document.getElementById('roe-json-input'),
-            schemaModalOverlay: document.getElementById('roe-schema-modal-overlay'),
-            schemaInput: document.getElementById('roe-schema-input'),
-            typeModalOverlay: document.getElementById('roe-type-modal-overlay'),
-            typeModalTitle: document.getElementById('roe-type-modal-title'),
-            typeGridArea: document.getElementById('roe-type-grid-area'),
-            typeConfigArea: document.getElementById('roe-type-config-area'),
-            exportModalOverlay: document.getElementById('roe-export-modal-overlay'),
-            exportOutput: document.getElementById('roe-export-output')
+            treeRoot: $('roe-tree-root'),
+            stats: $('roe-stats'),
+            searchWrapper: $('roe-search-wrapper'),
+            searchInput: $('roe-search'),
+            dropdown: $('roe-dropdown'),
+            modalOverlay: $('roe-modal-overlay'),
+            modalTitle: $('roe-modal-title'),
+            modalKey: $('roe-modal-key'),
+            modalType: $('roe-modal-type'),
+            modalValue: $('roe-modal-value'),
+            modalValRow: $('roe-modal-val-row'),
+            jsonModalOverlay: $('roe-json-modal-overlay'),
+            jsonInput: $('roe-json-input'),
+            schemaModalOverlay: $('roe-schema-modal-overlay'),
+            schemaInput: $('roe-schema-input'),
+            typeModalOverlay: $('roe-type-modal-overlay'),
+            typeModalTitle: $('roe-type-modal-title'),
+            typeGridArea: $('roe-type-grid-area'),
+            typeConfigArea: $('roe-type-config-area'),
+            exportModalOverlay: $('roe-export-modal-overlay'),
+            exportOutput: $('roe-export-output')
         };
+
+        // 模态框用 position:fixed 覆盖全屏，但若编辑器被放进 MacWindow
+        // （.mac-window 有 overflow:hidden），会被窗口裁切。
+        // 因此把遮罩层移到 body 下，仍由本实例持有引用与事件，互不干扰。
+        this._modals = [
+            this.dom.modalOverlay, this.dom.jsonModalOverlay, this.dom.schemaModalOverlay,
+            this.dom.typeModalOverlay, this.dom.exportModalOverlay
+        ].filter(Boolean);
+        this._modals.forEach(m => {
+            m.style.zIndex = '100000';   // 高于 MacWindow(10000+)
+            document.body.appendChild(m);
+        });
+    }
+
+    /**
+     * 按 id 查找元素：先在自身容器内找，再到本实例已移出的模态框里找。
+     * 原实现用 document.getElementById，页面存在多个编辑器实例时
+     * 会互相抢占按钮/模态框事件；这里限定查找范围，实现多实例隔离。
+     */
+    _$(id) {
+        const inC = this.container.querySelector(`#${id}`);
+        if (inC) return inC;
+        if (this._modals) {
+            for (const m of this._modals) {
+                if (m.id === id) return m;
+                const hit = m.querySelector(`#${id}`);
+                if (hit) return hit;
+            }
+        }
+        return null;
     }
 
     // ==================== 渲染树 ====================
@@ -429,7 +567,7 @@ class RichObjectEditor {
         const dtype = this.getType(value);           // 数据类型: string/number/object...
         const isObj = dtype === 'object' || dtype === 'array';
         const pathStr = JSON.stringify(path);
-        const schemaDef = this.schema.get(pathStr);  // 查找 schema 定义
+        const schemaDef = this.getSchemaForPath(pathStr);  // 查找 schema 定义（含末级通配）
         const controlType = (schemaDef && schemaDef.type !== 'auto') ? schemaDef.type : dtype; // 实际控件类型
 
         const nodeDiv = document.createElement('div');
@@ -496,12 +634,19 @@ class RichObjectEditor {
         // 操作按钮
         const actions = document.createElement('div');
         actions.className = 'roe-actions';
+        // 推送按钮：把当前节点作为「控件定义」推到布局窗口
+        const pushBtnHtml = (this.enablePush && !isObj && !isRoot)
+            ? `<button class="roe-action-btn roe-push-btn" title="推送到布局窗口">➡️</button>`
+            : '';
         if (!this.hideNodeActions) {
             if (isObj) {
-                actions.innerHTML = `<button class="roe-action-btn" title="添加子项">➕</button><button class="roe-action-btn" title="删除">🗑️</button>`;
+                actions.innerHTML = `<button class="roe-action-btn" title="添加子项">➕</button><button class="roe-action-btn" title="复制">📄</button><button class="roe-action-btn" title="删除">🗑️</button>`;
             } else {
-                actions.innerHTML = `<button class="roe-action-btn" title="复制">📄</button><button class="roe-action-btn" title="删除">🗑️</button>`;
+                actions.innerHTML = `${pushBtnHtml}<button class="roe-action-btn" title="复制">📄</button><button class="roe-action-btn" title="删除">🗑️</button>`;
             }
+        } else if (pushBtnHtml) {
+            // 即使隐藏了增删按钮，也保留推送按钮
+            actions.innerHTML = pushBtnHtml;
         } else {
             actions.style.display = 'none';
         }
@@ -535,10 +680,24 @@ class RichObjectEditor {
             e.stopPropagation();
             this.deleteNode(path);
         });
+        // 推送到布局窗口
+        actions.querySelector('.roe-push-btn')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.pushControl(path);
+            // 轻量反馈
+            const btn = e.currentTarget;
+            const old = btn.textContent;
+            btn.textContent = '✅';
+            setTimeout(() => { btn.textContent = old; }, 700);
+        });
         if (isObj) {
             actions.querySelector('[title="添加子项"]')?.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.openModal('add', path);
+            });
+            actions.querySelector('[title="复制"]')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.duplicateNode(path);
             });
         } else {
             actions.querySelector('[title="复制"]')?.addEventListener('click', (e) => {
@@ -885,6 +1044,8 @@ class RichObjectEditor {
             { type: 'date', icon: '📅', name: '日期' },
             { type: 'password', icon: '🔒', name: '密码' },
             { type: 'email', icon: '📧', name: '邮箱' },
+            { type: 'label', icon: '🏷️', name: '标签' },
+            { type: 'button', icon: '🔘', name: '按钮' },
         ];
 
         // 显示路径和原始key信息
@@ -926,8 +1087,8 @@ class RichObjectEditor {
         this._renderTypeConfig(selectedType, currentSchema, pathStr);
 
         // 取消
-        const cancelBtn = document.getElementById('roe-type-modal-cancel');
-        const confirmBtn = document.getElementById('roe-type-modal-confirm');
+        const cancelBtn = this._$('roe-type-modal-cancel');
+        const confirmBtn = this._$('roe-type-modal-confirm');
         const closeTypeModal = () => {
             this.dom.typeModalOverlay.classList.remove('active');
             cancelBtn.replaceWith(cancelBtn.cloneNode(true));
@@ -1000,6 +1161,11 @@ class RichObjectEditor {
         // 通用字段
         html += `<div class="roe-schema-row"><label>标签 (label)</label><input type="text" id="roe-cfg-label" value="${s.label || ''}"></div>`;
         html += `<div class="roe-schema-row"><label>占位提示 (placeholder)</label><input type="text" id="roe-cfg-placeholder" value="${s.placeholder || ''}"></div>`;
+        // 关联 Excel 单元格 —— 控件与表格公式联动的关键
+        html += `<div class="roe-schema-row">
+            <label>关联单元格 (cell) — 填写后该控件与表格单元格双向联动，可参与公式计算</label>
+            <input type="text" id="roe-cfg-cell" value="${this._escapeHtml(s.cell || '')}" placeholder="如: A1 / B2 / C3">
+        </div>`;
 
         if (type === 'number' || type === 'range') {
             html += `<div class="roe-schema-row"><label>最小值 (min)</label><input type="number" id="roe-cfg-min" value="${s.min !== undefined ? s.min : ''}"></div>`;
@@ -1027,13 +1193,35 @@ class RichObjectEditor {
             html += `<button class="roe-btn" id="roe-cfg-add-option" style="margin-top:4px;">+ 添加选项</button>`;
         }
 
+        // 标签控件：value 即直接显示的文本（不需要单元格，纯展示）
+        if (type === 'label') {
+            html += `<div class="roe-schema-row"><label>显示文本 (value) — 标签上直接显示的内容</label>
+                <input type="text" id="roe-cfg-value" value="${this._escapeHtml(s.value || '')}" placeholder="如: 参数设置 / 实时状态"></div>`;
+            html += `<div class="roe-schema-row"><label>关联单元格 (cell，可选) — 留空则固定显示文本；填写后文本会随该单元格值变化</label>
+                <input type="text" id="roe-cfg-cell" value="${this._escapeHtml(s.cell || '')}" placeholder="如: A1"></div>`;
+        }
+
+        // 按钮控件：点击「主动刷新一次表格」—— 重新执行所有公式（含 JS / 请求命令）
+        if (type === 'button') {
+            html += `<div class="roe-schema-row"><label>按钮文字 (label)</label>
+                <input type="text" id="roe-cfg-label" value="${s.label || ''}" placeholder="如: 计算 / 重置 / 刷新"></div>`;
+            html += `<div class="roe-schema-row"><label>点击后写入的值 (value，可选) — 若填写关联单元格，点击时先把这个值写入该单元格</label>
+                <input type="text" id="roe-cfg-value" value="${this._escapeHtml(s.value || '')}" placeholder="如: 1 / RUN / 0"></div>`;
+            html += `<div class="roe-schema-row"><label>关联单元格 (cell，可选) — 点击时操作此单元格所在的表格</label>
+                <input type="text" id="roe-cfg-cell" value="${this._escapeHtml(s.cell || '')}" placeholder="如: A1"></div>`;
+            html += `<div style="font-size:11px; color:#64748b; line-height:1.6; margin-top:4px;">
+                作用：点击按钮只刷新<b style="color:#38bdf8">绑定的这一个表格</b>，并沿依赖链<b style="color:#38bdf8">链式刷新</b>关联单元格：<br>
+                · 填了「写入的值」→ 把该值赋给关联单元格，赋值会触发后续依赖单元格级联更新；<br>
+                · 没填值 → 不改动单元格，仅触发一次该单元格的依赖链刷新（重跑其下游公式里的 JS / 请求）。</div>`;
+        }
+
         html += '</div>';
         area.innerHTML = html;
 
         // 选项列表操作
         if (type === 'select' || type === 'radio') {
-            document.getElementById('roe-cfg-add-option')?.addEventListener('click', () => {
-                const container = document.getElementById('roe-cfg-options');
+            this._$('roe-cfg-add-option')?.addEventListener('click', () => {
+                const container = this._$('roe-cfg-options');
                 const row = document.createElement('div');
                 row.className = 'roe-option-row';
                 row.innerHTML = `<input type="text" placeholder="value" value="" class="roe-opt-value">
@@ -1051,34 +1239,43 @@ class RichObjectEditor {
     _collectTypeConfig(type) {
         const config = { type };
 
-        const keyAlias = document.getElementById('roe-cfg-keyAlias');
+        const keyAlias = this._$('roe-cfg-keyAlias');
         if (keyAlias && keyAlias.value) config.keyAlias = keyAlias.value;
 
-        const label = document.getElementById('roe-cfg-label');
+        const label = this._$('roe-cfg-label');
         if (label && label.value) config.label = label.value;
 
-        const placeholder = document.getElementById('roe-cfg-placeholder');
+        const placeholder = this._$('roe-cfg-placeholder');
         if (placeholder && placeholder.value) config.placeholder = placeholder.value;
 
+        const cell = this._$('roe-cfg-cell');
+        if (cell && cell.value) config.cell = cell.value.trim().toUpperCase();
+
+        // 标签/按钮控件的「值」：标签=显示文本，按钮=点击后写入单元格的值
+        const valEl = this._$('roe-cfg-value');
+        if (valEl && valEl.value !== '') config.value = valEl.value;
+
         if (type === 'number' || type === 'range') {
-            const min = document.getElementById('roe-cfg-min');
+            const min = this._$('roe-cfg-min');
             if (min && min.value !== '') config.min = parseFloat(min.value);
-            const max = document.getElementById('roe-cfg-max');
+            const max = this._$('roe-cfg-max');
             if (max && max.value !== '') config.max = parseFloat(max.value);
-            const step = document.getElementById('roe-cfg-step');
+            const step = this._$('roe-cfg-step');
             if (step && step.value !== '') config.step = parseFloat(step.value);
         }
         if (type === 'text' || type === 'number' || type === 'range') {
-            const unit = document.getElementById('roe-cfg-unit');
+            const unit = this._$('roe-cfg-unit');
             if (unit && unit.value) config.unit = unit.value;
         }
         if (type === 'textarea') {
-            const rows = document.getElementById('roe-cfg-rows');
+            const rows = this._$('roe-cfg-rows');
             if (rows && rows.value) config.rows = parseInt(rows.value);
         }
         if (type === 'select' || type === 'radio') {
             const options = [];
-            document.querySelectorAll('.roe-option-row').forEach(row => {
+            const optContainer = this._$('roe-cfg-options');
+            (optContainer ? optContainer.querySelectorAll('.roe-option-row') : [])
+                .forEach(row => {
                 const val = row.querySelector('.roe-opt-value')?.value;
                 const lbl = row.querySelector('.roe-opt-label')?.value;
                 if (val !== undefined && val !== '') {
@@ -1557,6 +1754,31 @@ class RichObjectEditor {
         this.debouncedSearch(query);
     }
 
+    /**
+     * 轻量「定位到节点」：若节点已可见则只高亮+滚动，不重建整棵树。
+     * jumpToPath 会 renderTree() 换掉全部 DOM，在外部持有节点引用
+     * （例如布局窗口联动选中）时会打断交互，故提供此温和版本。
+     */
+    revealPath(path) {
+        const pathStr = JSON.stringify(path);
+        let node = this.container.querySelector(`[data-path='${pathStr}']`);
+        if (!node) {
+            // 节点被折叠了，此时才需要展开并重建
+            let cur = [];
+            path.forEach(p => { cur.push(p); this.expandedPaths.add(JSON.stringify(cur)); });
+            this.renderTree();
+            node = this.container.querySelector(`[data-path='${pathStr}']`);
+        }
+        if (!node) return false;
+        this.container.querySelectorAll('.roe-node.matched').forEach(n => n.classList.remove('matched'));
+        node.classList.add('matched');
+        if (typeof node.scrollIntoView === 'function') {
+            node.scrollIntoView({ block: 'nearest' });
+        }
+        this.selectNode(node, path);
+        return true;
+    }
+
     jumpToPath(path, matchType = 'text') {
         this.dom.dropdown.classList.remove('show');
         this.isDropdownOpen = false;
@@ -1570,7 +1792,9 @@ class RichObjectEditor {
                 if (matchType === 'text') targetNode.classList.add('matched');
                 else if (matchType === 'pinyin-start') targetNode.classList.add('pinyin-start');
                 else if (matchType === 'pinyin-contains') targetNode.classList.add('pinyin-contains');
-                targetNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                if (typeof targetNode.scrollIntoView === 'function') {
+                    targetNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
                 this.selectNode(targetNode, path);
             }
         }, 50);
@@ -1604,7 +1828,7 @@ class RichObjectEditor {
     // ==================== 事件绑定 ====================
 
     bindEvents() {
-        document.getElementById('roe-expand-all').onclick = () => {
+        this._$('roe-expand-all').onclick = () => {
             const rec = (o, p) => {
                 if (typeof o !== 'object' || o === null) return;
                 this.expandedPaths.add(JSON.stringify(p));
@@ -1613,45 +1837,45 @@ class RichObjectEditor {
             rec(this.data, []);
             this.renderTree();
         };
-        document.getElementById('roe-collapse-all').onclick = () => {
+        this._$('roe-collapse-all').onclick = () => {
             this.expandedPaths.clear();
             this.renderTree();
         };
-        document.getElementById('roe-add-root').onclick = () => this.openModal('add', []);
+        this._$('roe-add-root').onclick = () => this.openModal('add', []);
         if (this.hideAddRoot) {
-            const addRootBtn = document.getElementById('roe-add-root');
+            const addRootBtn = this._$('roe-add-root');
             if (addRootBtn) addRootBtn.style.display = 'none';
         }
-        document.getElementById('roe-import-json').onclick = () => this.openJsonModal();
-        document.getElementById('roe-export-json').onclick = () => this.exportJson();
-        document.getElementById('roe-import-schema').onclick = () => this.openSchemaModal();
-        document.getElementById('roe-export-full').onclick = () => this.exportFull();
+        this._$('roe-import-json').onclick = () => this.openJsonModal();
+        this._$('roe-export-json').onclick = () => this.exportJson();
+        this._$('roe-import-schema').onclick = () => this.openSchemaModal();
+        this._$('roe-export-full').onclick = () => this.exportFull();
         if (this.hideImportExport) {
             ['roe-import-json', 'roe-export-json', 'roe-import-schema', 'roe-export-full'].forEach(id => {
-                const b = document.getElementById(id);
+                const b = this._$(id);
                 if (b) b.style.display = 'none';
             });
         }
 
-        document.getElementById('roe-json-modal-cancel').onclick = () => this.closeJsonModal();
-        document.getElementById('roe-json-modal-confirm').onclick = () => this.confirmJsonImport();
+        this._$('roe-json-modal-cancel').onclick = () => this.closeJsonModal();
+        this._$('roe-json-modal-confirm').onclick = () => this.confirmJsonImport();
         this.dom.jsonModalOverlay.onclick = (e) => { if (e.target === this.dom.jsonModalOverlay) this.closeJsonModal(); };
 
-        document.getElementById('roe-schema-modal-cancel').onclick = () => this.closeSchemaModal();
-        document.getElementById('roe-schema-modal-confirm').onclick = () => this.confirmSchemaImport();
+        this._$('roe-schema-modal-cancel').onclick = () => this.closeSchemaModal();
+        this._$('roe-schema-modal-confirm').onclick = () => this.confirmSchemaImport();
         this.dom.schemaModalOverlay.onclick = (e) => { if (e.target === this.dom.schemaModalOverlay) this.closeSchemaModal(); };
 
         // 导出全部模态框
-        document.getElementById('roe-export-modal-close').onclick = () => this.closeExportModal();
+        this._$('roe-export-modal-close').onclick = () => this.closeExportModal();
         this.dom.exportModalOverlay.onclick = (e) => { if (e.target === this.dom.exportModalOverlay) this.closeExportModal(); };
-        document.getElementById('roe-export-modal-copy').onclick = () => {
+        this._$('roe-export-modal-copy').onclick = () => {
             this.dom.exportOutput.select();
             navigator.clipboard.writeText(this.dom.exportOutput.value).then(() => {
-                document.getElementById('roe-export-modal-copy').textContent = '已复制!';
-                setTimeout(() => { document.getElementById('roe-export-modal-copy').textContent = '复制到剪贴板'; }, 1500);
+                this._$('roe-export-modal-copy').textContent = '已复制!';
+                setTimeout(() => { this._$('roe-export-modal-copy').textContent = '复制到剪贴板'; }, 1500);
             }).catch(() => { document.execCommand('copy'); });
         };
-        document.getElementById('roe-export-modal-download').onclick = () => {
+        this._$('roe-export-modal-download').onclick = () => {
             const blob = new Blob([this.dom.exportOutput.value], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -1661,8 +1885,8 @@ class RichObjectEditor {
             URL.revokeObjectURL(url);
         };
 
-        document.getElementById('roe-modal-cancel').onclick = () => this.closeModal();
-        document.getElementById('roe-modal-confirm').onclick = () => this.confirmModal();
+        this._$('roe-modal-cancel').onclick = () => this.closeModal();
+        this._$('roe-modal-confirm').onclick = () => this.confirmModal();
         this.dom.modalOverlay.onclick = (e) => { if (e.target === this.dom.modalOverlay) this.closeModal(); };
 
         this.dom.searchInput.oninput = (e) => this.search(e.target.value);

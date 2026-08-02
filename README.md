@@ -1,8 +1,9 @@
-# [四向 Pad 节点连线系统（MCU 引脚 / 寄存器可视化配置工具）](https://keymove.github.io/MCUEasyConfig/)
+# MCUEasyConfig（四向 Pad 节点连线系统 · MCU 引脚 / 寄存器可视化配置工具）
 
-一个纯前端的 MCU 引脚连线与寄存器配置可视化工具。在画布上拖出 MCU、自定义器件、外设，
-通过「四向 Pad」连线表达引脚连接关系，系统会**自动完成 AF 复用、GPIO 模式、上下拉、接口初始化代码生成**，
-并内置 **SVD 寄存器编辑器**，可逐寄存器、逐位地修改芯片寄存器、实时收集「寄存器变动值」直接贴进固件。
+> 项目代号 **MCUEasyConfig**：一个纯前端的 MCU 引脚连线与寄存器配置可视化工具。在画布上拖出 MCU、自定义器件、外设，
+> 通过「四向 Pad」连线表达引脚连接关系，系统会**自动完成 AF 复用、GPIO 模式、上下拉、接口初始化代码生成**，
+> 并内置 **SVD 寄存器编辑器**，可逐寄存器、逐位地修改芯片寄存器、实时收集「寄存器变动值」直接贴进固件。
+> 同时内置 **通信调试模块**（SWD 烧录 / 串口助手 / CAN 助手）用于固件联调。
 
 无需构建、无依赖安装，打开即用。
 
@@ -30,6 +31,14 @@
 - **寄存器变动值导出**：一键输出所有「与复位值不同」的 GPIO / SVD 寄存器（`0x地址,0x值,//寄存器名`），按地址升序，可直接贴进固件初始化。
 - **配置管理**：IO 功能库（config）导入 / 导出 / 应用 / 重置，持久化到浏览器 localStorage。
 
+### 通信调试模块（comm.js）
+
+- **SWD 烧录**：内置 SWD 调试 / 固件上传 UI（第一栏），走 `COMHelper` 底层 transport + SWD 协议封装。
+- **串口助手（第二栏）**：完全自绘面板（不依赖 rich-menu 控件），四区布局：
+  - 左上 RX 接收区、左下 TX 发送区（HEX 模式勾选 + 发送按钮）、右上快捷发送列表（每行 `[Hex勾选][文本][发送]` + 滚动）、右下串口设置（波特率 / 打开关闭）。
+  - 独立 transport 不与 SWD 共用端口；接收增量游标避免重复刷屏；收发均支持全局 HEX 模式；数据持久化到 localStorage。
+- **CAN 助手（第三栏）**：占位预留（UI 框架已搭，功能待实现）。
+
 ---
 
 ## 🚀 快速开始
@@ -38,7 +47,7 @@
 
 ```bash
 # 方式一：Python（无需安装）
-cd nodepad
+cd <项目根目录>
 python3 -m http.server 8000
 # 浏览器打开 http://localhost:8000
 
@@ -53,26 +62,33 @@ npx serve .
 ## 📁 目录结构
 
 ```
-nodepad/
+<项目根目录>/
 ├── index.html              入口页面（画布 + 顶部 Dock + 各面板容器）
 ├── config.bundle.js        由 config.json 生成的运行时配置（自动生成，勿手改）
 ├── CIU32F003x5.js          内置 MCU 寄存器库（SVD 转换产物，定义 window.MCU_REG_DB）
 ├── CIU32F003x5.svd / .sfd  MCU 原始 SVD / SFD 源文件
+├── cc/
+│   └── ...                 收藏夹 / 器件示例资源
 ├── js/
 │   ├── config.js           静态基础库（MCU gpio/af/special/封装 + 外设库）—— 由工具生成
 │   ├── node.js             节点类（Node）：创建、连线、序列化 / 反序列化
 │   ├── packages.js         封装生成（SOP/LQFP/QFN）、特殊功能归一、信号识别
 │   ├── af-menu.js          MCU IO 右键菜单（模式 / AF 快速选择）
 │   ├── system.js           核心 NodeSystem：节点管理、连接绘制、缩放平移、接口初始化、SVD 写入
-│   └── svd-lib.js          SVD 寄存器库管理（localStorage 持久化、当前激活 MCU 匹配）
+│   ├── svd-lib.js          SVD 寄存器库管理（localStorage 持久化、当前激活 MCU 匹配）
+│   ├── comm.js             通信调试模块（SWD / 串口助手 / CAN 助手三栏 Tab，MacWindow 容器）
+│   ├── swd.js              SWD 底层协议 / transport 封装
+│   ├── main.js             顶层入口：画布初始化、Dock、各面板挂接
+│   └── toast.js            轻量提示组件
 ├── rich-obj-editor.js      RichObjectEditor 组件（树形 + 搜索 + 富控件，SVD 编辑器内核）
 ├── rich-menu.js / dock.js / macwindow.js   顶栏 Dock / 菜单 / macOS 风格窗口
 ├── svd2js.js               SVD + SFD → JS 转换器（见下）
+├── excel.js                表格 / 数据导入导出辅助
 ├── tools/                  配置 / 库生成与校验脚本
 │   ├── gen-config-js.js       硬件库源(config.full.json) → js/config.js
 │   ├── gen-config-bundle.js   config.json → config.bundle.js
 │   ├── check-config.js        校验配置合法性
-│   ├── migrate-config.js      配置迁移
+│   ├── migrate-config.js      配置版本迁移
 │   └── add-signal-config.js   追加信号配置
 └── io-config.example.json  IO 功能库导入 / 导出示例
 ```
@@ -117,7 +133,15 @@ nodepad/
 - 字段控件：勾选框（1 位）/ 下拉（有 options）/ 数字（多位），与顶部十六进制「寄存器值」双向同步。
 - 改动实时写回 `nodeSystem.svdRegValues`（按 SVD 命名空间隔离，多 MCU 不串），并收集进「寄存器变动值」。
 
-### 5. 配置管理（config.js / svd-lib.js）
+### 5. 串口助手（comm.js → buildUartPanel）
+
+- 自绘四区面板（RX / TX / 快捷发送 / 串口设置），仅在「串口助手」Tab 激活时显示（`.uart-panel.active` 绝对定位填满面板）。
+- 右上快捷发送列表：每行 `[Hex勾选框][文本输入][发送按钮]`，列表可滚动；勾选框表示该行文本按 Hex 发送。
+- 左下 TX 发送区底栏含「HEX 模式」勾选 + 发送按钮；全局 `HEX` 模式（`__uartHexMode`）下收发均按 Hex 处理。
+- 接收区增量游标（`__uartRecvLen`）处理 `COMHelper.buffer` 累积数组，避免重复刷屏。
+- 下载算法与快捷发送数据持久化到 localStorage。
+
+### 6. 配置管理（config.js / svd-lib.js）
 
 - IO 功能库持久化在浏览器 localStorage；`config.json` 仅作导入 / 导出介质（导入即叠加到基础库）。
 - 重置恢复默认（硬件库始终来自 `js/config.js`）。
@@ -173,3 +197,4 @@ window.MCU_REG_DB["CIU32F003x5"] = {
 - **打开是空白？** 需用 HTTP 服务访问（见「快速开始」），直接双击 `index.html`（`file://`）部分浏览器会限制脚本加载。
 - **想换 MCU？** 用 `svd2js.js` 转换对应 SVD/SFD，把生成的 JS 加入 `index.html` 的 `<script>` 并在 SVD 库切换即可。
 - **配置改乱了？** 「配置菜单 → 重置」清除本地存储恢复默认。
+- **串口助手看不到？** 串口助手面板仅在 comm 模块「串口助手」Tab 激活时浮出；切到 SWD/CAN 时自动隐藏。

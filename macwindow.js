@@ -344,6 +344,15 @@
                         const controls = document.createElement('div');
                         controls.className = 'window-controls';
                         controls.innerHTML = `<div class="control-btn close"></div>`;
+                        // 点击关闭按钮：默认只隐藏窗口（不销毁），可通过 onWindowClose 自定义
+                        const closeBtn = controls.querySelector('.control-btn.close');
+                        if (closeBtn) {
+                            closeBtn.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                if (typeof this.onWindowClose === 'function') this.onWindowClose(this);
+                                this.hide();
+                            });
+                        }
                         this.titleBar.appendChild(controls);
                     }
                     

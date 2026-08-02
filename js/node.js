@@ -438,6 +438,7 @@ class Node {
         const dev = this.config && this.config.device;
         if (!dev || !dev.gpio || !dev.gpio.reset) return val;
         const reset = dev.gpio.reset;
+        const hxv = (v) => (v == null ? 0 : (typeof v === 'string' ? parseInt(v, 16) : v) >>> 0);
         for (const s of ['top', 'right', 'bottom', 'left']) {
             const list = this.config[s] || [];
             list.forEach((entry, i) => {
@@ -446,10 +447,10 @@ class Node {
                 if (pl !== L) return;
                 const y = parseInt(entry.port.replace(/\D/g, ''), 10);
                 if (isNaN(y) || y < 0 || y > 15) return;
-                const rMode  = (reset.MODE  && reset.MODE[L]  != null) ? (reset.MODE[L]  >>> 0) : 0;
-                const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? (reset.PUPD[L]  >>> 0) : 0;
-                const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? (reset.OTYPE[L] >>> 0) : 0;
-                const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? (reset.AFL[L]   >>> 0) : 0;
+                const rMode  = (reset.MODE  && reset.MODE[L]  != null) ? hxv(reset.MODE[L])  : 0;
+                const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? hxv(reset.PUPD[L])  : 0;
+                const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? hxv(reset.OTYPE[L]) : 0;
+                const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? hxv(reset.AFL[L])   : 0;
                 val.MODE  |= (((rMode  >> (y * 2)) & 0x3) << (y * 2));
                 val.OTYPE |= (((rOtype >> y) & 0x1) << y);
                 val.PUPD  |= (((rPupd  >> (y * 2)) & 0x3) << (y * 2));
@@ -475,10 +476,11 @@ class Node {
         const y = parseInt(entry.port.replace(/\D/g, ''), 10);
         if (isNaN(y) || y < 0 || y > 15) return def;
         const reset = dev.gpio.reset;
-        const rMode  = (reset.MODE  && reset.MODE[L]  != null) ? (reset.MODE[L]  >>> 0) : 0;
-        const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? (reset.PUPD[L]  >>> 0) : 0;
-        const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? (reset.OTYPE[L] >>> 0) : 0;
-        const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? (reset.AFL[L]   >>> 0) : 0;
+        const hxv = (v) => (v == null ? 0 : (typeof v === 'string' ? parseInt(v, 16) : v) >>> 0);
+        const rMode  = (reset.MODE  && reset.MODE[L]  != null) ? hxv(reset.MODE[L])  : 0;
+        const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? hxv(reset.PUPD[L])  : 0;
+        const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? hxv(reset.OTYPE[L]) : 0;
+        const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? hxv(reset.AFL[L])   : 0;
         return {
             mode:  (rMode  >> (y * 2)) & 0x3,
             pupd:  (rPupd  >> (y * 2)) & 0x3,

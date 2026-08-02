@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>C4 Compiler IDE · 寄存器 / Thumb M0</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#171b24; --panel2:#1e2430; --border:#2a3140;
+    --fg:#d7dce5; --muted:#8b94a7; --accent:#4ea1ff; --accent2:#39d98a;
+    --warn:#ffb454; --err:#ff6b6b; --mono:'SF Mono',Consolas,'Liberation Mono',Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.3px}
+  header h1 span{color:var(--accent)}
+  .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:auto}
+  label.ctl{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted)}
+  select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:13px}
+  button{background:var(--accent);color:#06121f;border:none;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;font-size:13px}
+  button.ghost{background:var(--panel2);color:var(--fg);border:1px solid var(--border)}
+  button:hover{filter:brightness(1.08)}
+  button:active{transform:translateY(1px)}
+  .main{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);min-height:0}
+  .pane{background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:0}
+  .pane h2{font-size:12px;margin:0;padding:8px 12px;background:var(--panel2);border-bottom:1px solid var(--border);color:var(--muted);font-weight:600;letter-spacing:.4px;display:flex;justify-content:space-between;align-items:center}
+  .pane h2 .tabs{display:flex;gap:6px}
+  .tab{padding:3px 10px;border-radius:5px;cursor:pointer;color:var(--muted);font-size:11px}
+  .tab.active{background:var(--accent);color:#06121f}
+  textarea#src{width:100%;flex:1;border:none;background:#11141c;color:#e6ebf2;padding:12px;font:13px/1.55 var(--mono);resize:none;outline:none;tab-size:2}
+  .mapwrap{flex:1;overflow:auto;padding:0}
+  pre.asm{margin:0;padding:12px;font:12.5px/1.5 var(--mono);white-space:pre;color:#c7d0dd}
+  pre.asm .cl{color:var(--accent2)}
+  pre.asm .ch{color:var(--warn)}
+  .pair{display:grid;grid-template-columns:auto 1fr;gap:0;border-bottom:1px solid #1b2030}
+  .pair .c{background:#141821;padding:6px 12px;border-right:1px solid #232a38;color:#9fd0ff;font:12px/1.5 var(--mono);white-space:pre-wrap}
+  .pair .a{padding:0;font:12px/1.5 var(--mono)}
+  .pair .a div{padding:4px 12px;border-bottom:1px dashed #1b2030}
+  .pair .a div .addr{color:var(--warn);margin-right:10px}
+  .pair .a div .hex{color:#6f7a8d;margin-right:10px}
+  .out{flex:1;overflow:auto;background:#0b0e14;padding:12px;font:12.5px/1.5 var(--mono);white-space:pre-wrap;color:#cdd5e1}
+  .out .err{color:var(--err)}
+  .out .regs{color:var(--accent2)}
+  .statusbar{padding:6px 16px;background:var(--panel);border-top:1px solid var(--border);font-size:12px;color:var(--muted);display:flex;gap:16px}
+  .statusbar b{color:var(--fg)}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-1px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .hint{font-size:11px;color:var(--muted)}
+  /* 设置模态窗口 */
+  .modal-mask{position:fixed;inset:0;background:rgba(6,9,15,.62);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal-mask.show{display:flex}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;width:380px;max-width:92vw;box-shadow:0 18px 50px rgba(0,0,0,.5);overflow:hidden}
+  .modal h3{margin:0;padding:14px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-size:14px;font-weight:600}
+  .modal .body{padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+  .modal .row{display:flex;flex-direction:column;gap:4px}
+  .modal .row label{font-size:11px;color:var(--muted)}
+  .modal .row input{background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:7px 9px;font:13px var(--mono)}
+  .modal .foot{padding:12px 18px;background:var(--panel2);border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
+  .modal .foot button{padding:7px 16px}
+</style>
+</head>
+<body>
+<header>
+  <h1>C4 <span>Compiler IDE</span></h1>
+  <div class="controls">
+    <label class="ctl">后端
+      <select id="backend">
+        <option value="reg">寄存器 VM</option>
+        <option value="thumb">Thumb M0</option>
+      </select>
+    </label>
+    <label class="ctl">优化档
+      <select id="opt">
+        <option value="0">-O0</option>
+        <option value="1">-O1</option>
+        <option value="2" selected>-O2</option>
+        <option value="3">-O3</option>
+        <option value="4">-O4</option>
+        <option value="5">-O5</option>
+      </select>
+    </label>
+    <label class="ctl">argv（空格分隔）
+      <input id="argv" type="text" placeholder="arg1 arg2" style="width:140px" />
+    </label>
+    <label class="ctl">trace
+      <select id="trace">
+        <option value="0">关</option>
+        <option value="1">-d1</option>
+        <option value="2">-d2</option>
+      </select>
+    </label>
+    <button id="btnRun">▶ 编译并运行</button>
+    <button id="btnAsm" class="ghost">⚙ 仅编译 / 看汇编</button>
+    <button id="btnSettings" class="ghost" title="Thumb M0 内存参数">⚙ 内存设置</button>
+    <button id="btnBin" class="ghost" title="生成 ROM.bin 并下载（仅 Thumb M0）">⤓ 生成 bin 并下载</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="pane">
+    <h2>C 源码 <span class="hint">支持 int/char/short/指针/struct/循环/数组</span></h2>
+    <textarea id="src" spellcheck="false"></textarea>
+  </div>
+
+  <div class="pane">
+    <h2>
+      <span>输出</span>
+      <span class="tabs">
+        <span class="tab active" data-view="asm">C↔汇编对照</span>
+        <span class="tab" data-view="out">运行输出</span>
+      </span>
+    </h2>
+    <div class="mapwrap" id="viewAsm"><pre class="asm" id="asmPre">// 点击「仅编译 / 看汇编」生成对照</pre></div>
+    <div class="mapwrap" id="viewOut" style="display:none"><div class="out" id="outPre"></div></div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <span id="stState">就绪</span>
+  <span>后端: <b id="stBackend">reg</b></span>
+  <span>主函数地址: <b id="stMain">-</b></span>
+  <span id="stInfo" class="hint">C4 编译器 · 寄存器 VM / ARM Thumb M0 双后端</span>
+</div>
+
+<!-- 内存参数设置模态窗口（仅对 Thumb M0 后端生效）-->
+<div class="modal-mask" id="settingsMask">
+  <div class="modal">
+    <h3>Thumb M0 内存参数</h3>
+    <div class="body">
+      <div class="row"><label>romBase（ROM 基地址，十六进制）</label><input id="setRomBase" type="text" value="0x20000000" /></div>
+      <div class="row"><label>ramBase（RAM 基地址，十六进制）</label><input id="setRamBase" type="text" value="0x20000C00" /></div>
+      <div class="row"><label>ramSize（RAM 大小，十进制字节）</label><input id="setRamSize" type="text" value="1020" /></div>
+      <div class="row"><label>stackSize（栈大小，十六进制）</label><input id="setStackSize" type="text" value="0x100" /></div>
+    </div>
+    <div class="foot">
+      <button id="setCancel" class="ghost">取消</button>
+      <button id="setSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 纯前端运行：仅引用这两个文件即可，无需服务器 -->
+<script src="c4_reg.js"></script>
+<script src="thumb_backend.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+let lastSource = '';
+
+// Thumb M0 后端内存参数（模态窗口设置）
+const memParams = { romBase:0x20000000, ramBase:0x20000C00, ramSize:1020, stackSize:0x100 };
+function parseHexOrDec(s){
+  s=(s||'').trim();
+  if(/^0x/i.test(s)) return parseInt(s,16);
+  if(/^-?\d+$/.test(s)) return parseInt(s,10);
+  return parseInt(s,16);
+}
+
+const DEFAULT_SRC = `// 一个简单的 C 程序 —— 试试改一改，再编译/运行
+int gcd(int a, int b){
+    while(b){
+        int t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+int fib(int n){
+    int a=0,b=1,i;
+    for(i=0;i<n;i++){
+        int c=a+b;
+        a=b; b=c;
+    }
+    return a;
+}
+
+int main(){
+    int x = gcd(48, 36);
+    int y = fib(10);
+    printf("gcd(48,36)=%d\\n", x);
+    printf("fib(10)=%d\\n", y);
+    return x + y;
+}
+`;
+
+$('src').value = DEFAULT_SRC;
+
+document.querySelectorAll('.tab').forEach(t=>{
+  t.onclick = ()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    const v = t.dataset.view;
+    $('viewAsm').style.display = v==='asm'?'block':'none';
+    $('viewOut').style.display = v==='out'?'block':'none';
+  };
+});
+
+$('backend').onchange = ()=>{
+  $('stBackend').textContent = $('backend').value;
+  $('btnBin').disabled = $('backend').value !== 'thumb';
+};
+$('btnBin').disabled = $('backend').value !== 'thumb';
+
+// ---- 生成 ROM.bin 并下载（仅 Thumb M0）----
+function doGenBin(p){
+  const backend=new ThumbBackend(p.optLevel);
+  backend.enableLineMapping(p.source);
+  const c=new kc_reg(1, backend);
+  const sysFuncs=makeThumbSysFuncs();
+  const mainAddr=c.Comper(p.source,1,sysFuncs);
+  const rom=backend.genROM(mainAddr,[],null,c,{
+    romBase:memParams.romBase, ramBase:memParams.ramBase,
+    ramSize:memParams.ramSize, stackSize:memParams.stackSize
+  });
+  if(!rom || !rom.length) throw Error('生成的 ROM 为空');
+  return { ok:true, rom, mainAddr };
+}
+
+function downloadBin(rom){
+  const buf=new Uint8Array(rom);
+  const blob=new Blob([buf], {type:'application/octet-stream'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='rom.bin';
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
+$('btnBin').onclick = ()=>{
+  setBusy(true);
+  try{
+    const p=currentPayload(); lastSource=p.source;
+    const r=doGenBin(p);
+    downloadBin(r.rom);
+    $('stMain').textContent = r.mainAddr!=null ? ('0x'+(r.mainAddr>>>0).toString(16)) : '-';
+    $('stState').textContent = '已生成 rom.bin ('+r.rom.length+' B)';
+  }catch(e){ $('stState').textContent='生成失败: '+(e.message||e); }
+  finally{ setBusy(false); }
+};
+
+// ---- 内存参数设置模态窗口 ----
+(function setupSettingsModal(){
+  const mask=$('settingsMask');
+  function toHex(v){ return '0x'+((v>>>0).toString(16)).toUpperCase(); }
+  function open(){
+    $('setRomBase').value = toHex(memParams.romBase);
+    $('setRamBase').value = toHex(memParams.ramBase);
+    $('setRamSize').value = String(memParams.ramSize);
+    $('setStackSize').value = toHex(memParams.stackSize);
+    mask.classList.add('show');
+  }
+  function close(){ mask.classList.remove('show'); }
+  $('btnSettings').onclick = open;
+  $('setCancel').onclick = close;
+  mask.addEventListener('click', e=>{ if(e.target===mask) close(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape' && mask.classList.contains('show')) close(); });
+  $('setSave').onclick = ()=>{
+    memParams.romBase = parseHexOrDec($('setRomBase').value);
+    memParams.ramBase = parseHexOrDec($('setRamBase').value);
+    memParams.ramSize = parseHexOrDec($('setRamSize').value);
+    memParams.stackSize = parseHexOrDec($('setStackSize').value);
+    close();
+  };
+})();
+
+function setBusy(b){
+  $('stState').innerHTML = b ? '<span class="spinner"></span> 工作中…' : '就绪';
+  $('btnRun').disabled = b; $('btnAsm').disabled = b;
+}
+
+function renderMapping(map, asmRaw){
+  const pre = $('asmPre');
+  if(!map){
+    pre.innerHTML = '<span class="cl">// 无法生成 C↔汇编对照（该后端未启用行映射）</span>\n\n' +
+      (asmRaw ? escapeHtml(asmRaw) : '');
+    return;
+  }
+  const keys = Object.keys(map).map(Number).sort((a,b)=>a-b);
+  if(keys.length===0){
+    pre.innerHTML = '<span class="cl">// 无行映射数据。汇编原文：</span>\n' + escapeHtml(asmRaw||'');
+    return;
+  }
+  let html = '';
+  for(const ln of keys){
+    const entries = map[ln];
+    const c = (lastSource.split('\n')[ln-1]||'').trimEnd();
+    html += '<div class="pair"><div class="c">'+ln+': '+(c?escapeHtml(c):' ')+'</div><div class="a">';
+    if(entries.length===0){
+      html += '<div><span class="ch">（无对应指令）</span></div>';
+    } else {
+      for(const e of entries){
+        html += '<div><span class="addr">'+escapeHtml(e.addr||'')+'</span>'+
+                (e.hex?'<span class="hex">'+escapeHtml(e.hex)+'</span>':'')+
+                escapeHtml(e.text||'')+'</div>';
+      }
+    }
+    html += '</div></div>';
+  }
+  pre.innerHTML = html;
+}
+
+function escapeHtml(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function renderOutput(o){
+  const pre = $('outPre');
+  let html = '';
+  if(o.error){ html += '<span class="err">编译/运行错误: '+escapeHtml(o.error)+'</span>'; }
+  else {
+    if(o.output) html += escapeHtml(o.output);
+    if(o.regs){
+      html += '\n<span class="regs">--- 寄存器 ---</span>\n';
+      for(const k of ['R0','R1','R2','R3','R4','R5','R6','R7','SP','LR','PC','CPSR'])
+        html += k+' = 0x'+(o.regs[k]>>>0).toString(16).padStart(8,'0').toUpperCase()+'\n';
+    }
+  }
+  pre.innerHTML = html || '<span class="hint">（无输出）</span>';
+}
+
+// ---- 浏览器内联编译/运行（纯前端，无服务器）----
+const { kc_reg, RegBackend, opcode, tokens } = window.C4Reg;
+const { ThumbBackend } = window.C4Thumb;
+
+function currentPayload(){
+  return {
+    source: $('src').value,
+    backend: $('backend').value,
+    optLevel: parseInt($('opt').value,10),
+    argv: $('argv').value.trim().split(/\s+/).filter(Boolean),
+    trace: parseInt($('trace').value,10),
+  };
+}
+
+// 从 CPU 内存读取以 \0 结尾的字符串
+function readCpuStr(ctx, addr){
+  const mem = ctx._cpu && ctx._cpu.memory;
+  if(!mem){ let s=''; for(let i=addr; ctx.data[i]; i++) s+=String.fromCharCode(ctx.data[i]); return s; }
+  let s='', max=4096;
+  while(max--){ const b=mem.readByte(addr); if(b===0) break; s+=String.fromCharCode(b); addr++; }
+  return s;
+}
+
+// 寄存器 VM 后端用的 sysfunc（覆盖 defaultSysFuncs，去掉对 process 的依赖）
+const regSysFuncs = Object.assign({}, kc_reg.defaultSysFuncs, {
+  printf:(ctx,sp,ac)=>{ const r=ctx.printf(ctx.Intdata[(sp>>2)+ac-1],ctx.Intdata[(sp>>2)+ac-2],ctx.Intdata[(sp>>2)+ac-3],ctx.Intdata[(sp>>2)+ac-4]); ctx.output+=r; return 0; },
+  exit:(ctx,sp)=>{ const msg=`exit(${ctx.Intdata[sp>>2]})\r\n`; ctx.output+=msg; ctx._exitFlag=true; return 0; },
+});
+
+// Thumb M0 后端用的 sysfunc（字符串从真实 CPU 内存读取）
+function makeThumbSysFuncs(){
+  return {
+    printf:(ctx,sp,ac)=>{
+      const base=sp>>2;
+      let fmtPtr=ctx.Intdata[base];
+      if(fmtPtr>0 && fmtPtr<0x10000) fmtPtr+=0x20000C00;
+      const fmt=readCpuStr(ctx,fmtPtr);
+      let result='', ai=1;
+      for(let i=0;i<fmt.length;i++){
+        if(fmt[i]==='%'){
+          i++; let width=-1;
+          if(i<fmt.length && fmt[i]>='0' && fmt[i]<='9'){ width=0; while(i<fmt.length && fmt[i]>='0' && fmt[i]<='9'){ width=width*10+(fmt.charCodeAt(i)-48); i++; } }
+          if(i>=fmt.length) break;
+          const spec=fmt[i]; let val; const argVal=ctx.Intdata[base+ai]; ai++;
+          switch(spec){
+            case 'd': val=''+(argVal|0); break;
+            case 'u': val=''+(argVal>>>0); break;
+            case 'x': val=(argVal>>>0).toString(16); break;
+            case 'c': val=String.fromCharCode(argVal&0xFF); break;
+            case 's': val=readCpuStr(ctx,argVal); break;
+            case '%': val='%'; break;
+            default: val='%'+spec; break;
+          }
+          if(width>0 && val.length<width) val=' '.repeat(width-val.length)+val;
+          result+=val; continue;
+        }
+        result+=fmt[i];
+      }
+      ctx.output+=result; return 0;
+    },
+    exit:(ctx,sp)=>{ const msg=`exit(${ctx.Intdata[sp>>2]})\r\n`; ctx.output+=msg; ctx._exitFlag=true; return 0; },
+    malloc:(ctx,sp)=>{ const r=ctx.datapos; ctx.datapos+=ctx.Intdata[sp>>2]; ctx.datapos=(ctx.datapos+ctx.intsizeof)&(-ctx.intsizeof); return r; },
+    free:()=>0,
+    memset:(ctx,sp)=>{ const b=sp>>2; const d1=ctx.Intdata[b], v1=ctx.Intdata[b+1]&0xFF, c1=ctx.Intdata[b+2]; for(let i=0;i<c1;i++) ctx.rwdata[d1+i]=v1; return 0; },
+    memcpy:(ctx,sp)=>{ const b=sp>>2; const dst=ctx.Intdata[b], src=ctx.Intdata[b+1], n=ctx.Intdata[b+2]; for(let i=0;i<n;i++) ctx.rwdata[dst+i]=ctx.rwdata[src+i]; return 0; },
+    memcmp:(ctx,sp)=>{ const b=sp>>2; const s1=ctx.Intdata[b], s2=ctx.Intdata[b+1], ln=ctx.Intdata[b+2]; let df=0; for(let i=0;i<ln;i++){ if(ctx.rwdata[s1+i]!==ctx.rwdata[s2+i]){ df=1; break; } } return df; },
+  };
+}
+
+function buildThumbMapping(backend, srcLines){
+  const asm=backend.asm;
+  if(!backend.srcLineMap || !backend._lastBodyLines || !backend._lastCodeBytes || !asm || !asm._lastLineAddrs) return null;
+  const bodyStartIdx=(backend._lastStartupLines||[]).length+1;
+  const srcToAsm={}; let currentSrcLine=-1;
+  for(let i=0;i<backend._lastBodyLines.length;i++){
+    const line=backend._lastBodyLines[i]; const trimmed=line.trim();
+    const fullIdx=bodyStartIdx+i;
+    const srcMatch=trimmed.match(/^;@src=(\d+)$/);
+    if(srcMatch){ currentSrcLine=parseInt(srcMatch[1]); continue; }
+    if(!trimmed || trimmed.startsWith(';') || trimmed.endsWith(':') || /^\.(ltorg|pool)\s*$/i.test(trimmed)) continue;
+    const addr=asm._lastLineAddrs[fullIdx];
+    if(addr<0) continue;
+    const sz=trimmed.startsWith('BL')&&/BL(\s|\.W?\s)/i.test(trimmed)?4:2;
+    if(sz===0) continue;
+    const byteOff=addr-(backend._lastFullCodeBase||0);
+    let hexBytes='';
+    if(byteOff>=0 && byteOff+sz<=backend._lastCodeBytes.length){
+      for(let hw=0;hw<sz;hw+=2){
+        const b0=backend._lastCodeBytes[byteOff+hw], b1=backend._lastCodeBytes[byteOff+hw+1];
+        hexBytes+=b1.toString(16).padStart(2,'0').toUpperCase()+b0.toString(16).padStart(2,'0').toUpperCase();
+      }
+    }
+    if(currentSrcLine>0){
+      (srcToAsm[currentSrcLine]=srcToAsm[currentSrcLine]||[]).push({ addr:'0x'+addr.toString(16).padStart(8,'0').toUpperCase(), hex:hexBytes, text:trimmed });
+    }
+  }
+  return srcToAsm;
+}
+
+function doCompile(p){
+  const srcLines=p.source.split('\n');
+  if(p.backend==='thumb'){
+    const backend=new ThumbBackend(p.optLevel);
+    backend.enableLineMapping(p.source);
+    const c=new kc_reg(1, backend);
+    const sysFuncs=makeThumbSysFuncs();
+    const mainAddr=c.Comper(p.source,1,sysFuncs);
+    backend.genROM(mainAddr,[],null,c,{
+      romBase:memParams.romBase, ramBase:memParams.ramBase,
+      ramSize:memParams.ramSize, stackSize:memParams.stackSize
+    });
+    const mapping=buildThumbMapping(backend,srcLines);
+    const asmText=(backend._lastBodyLines||[]).join('\n');
+    const summary=backend._lastSummary||'';
+    return { ok:true, backend:'thumb', mapping, asm:asmText, summary, mainAddr };
+  } else {
+    const c=new kc_reg(1,new RegBackend());
+    const mainAddr=c.Comper(p.source,1,regSysFuncs);
+    const mapping=null;
+    return { ok:true, backend:'reg', mapping, asm:'', mainAddr };
+  }
+}
+
+function doRun(p){
+  if(p.backend==='thumb'){
+    const backend=new ThumbBackend(p.optLevel);
+    const c=new kc_reg(1,backend);
+    const sysFuncs=makeThumbSysFuncs();
+    const mainAddr=c.Comper(p.source,1,sysFuncs);
+    backend.run(mainAddr,['c4',...p.argv],c,{
+      romBase:memParams.romBase, ramBase:memParams.ramBase,
+      ramSize:memParams.ramSize, stackSize:memParams.stackSize
+    });
+    const regs=backend._cpu?backend._cpu.dumpRegs():null;
+    return { ok:true, backend:'thumb', output:c.output||'', regs, mainAddr, exitCode:c._exitFlag?0:1 };
+  } else {
+    const c=new kc_reg(1,new RegBackend());
+    const mainAddr=c.Comper(p.source,1,regSysFuncs);
+    c.run(mainAddr,['c4',...p.argv],p.trace);
+    return { ok:true, backend:'reg', output:c.output||'', regs:null, mainAddr, exitCode:c._exitFlag?0:1 };
+  }
+}
+
+$('btnAsm').onclick = ()=>{
+  setBusy(true);
+  try{
+    const p=currentPayload(); lastSource=p.source;
+    const r=doCompile(p);
+    if(r.ok){
+      renderMapping(r.mapping, r.asm);
+      $('stMain').textContent = r.mainAddr!=null ? ('0x'+(r.mainAddr>>>0).toString(16)) : '-';
+      if(r.backend==='thumb' && r.summary){
+        $('outPre').innerHTML = '<pre class="asm" style="padding:0">'+escapeHtml(r.summary)+'</pre>';
+        document.querySelector('[data-view="out"]').click();
+      } else {
+        document.querySelector('[data-view="asm"]').click();
+      }
+    } else {
+      $('asmPre').innerHTML='<span class="cl">// 编译失败</span>\n'+escapeHtml(r.error||'');
+    }
+  }catch(e){ $('asmPre').textContent='编译失败: '+(e.message||e); }
+  finally{ setBusy(false); }
+};
+
+$('btnRun').onclick = ()=>{
+  setBusy(true);
+  try{
+    const p=currentPayload(); lastSource=p.source;
+    const r=doRun(p);
+    renderOutput(r);
+    if(r.ok) $('stMain').textContent = r.mainAddr!=null ? ('0x'+(r.mainAddr>>>0).toString(16)) : '-';
+    document.querySelector('[data-view="out"]').click();
+  }catch(e){ $('outPre').textContent='运行失败: '+(e.message||e); }
+  finally{ setBusy(false); }
+};
+</script>
+</body>
+</html>

@@ -207,6 +207,42 @@ function buildCustomDevice(def) {
     }
     const title = titleParts.join(' · ');
 
+    // —— 设备风格（MCU 自定义）：带 gpio / af / special 复用表，节点按 device 处理 ——
+    // 判定：def 携带 af 或 gpio 或 special，且引脚声明了 port（否则退回外设风格）。
+    const isDevice = !!(def.af || def.gpio || def.special) && (pins.some(p => p.port));
+
+    const physical = {};
+    pins.forEach(p => { if (p.port) physical[p.port] = p.pin; });
+
+    if (isDevice) {
+        return {
+            name: def.name || '自定义设备',
+            title: title,
+            chip: true,
+            chipType: def.packageType || def.pkg || 'SOP',
+            chipColor: '#243a52',
+            device: {
+                key: '__custom_dev__',
+                name: def.name || '自定义设备',
+                af: def.af || null,
+                special: def.special || null,
+                physical: physical,
+                gpio: def.gpio || null,
+                svdKey: def.svdKey || '__auto__'   // 显式绑定的 SVD（'__auto__' 按型号自动匹配）
+            },
+            pkg: def.pkg || null,
+            iface: def.iface || null,
+            converter: !!def.converter,
+            deviceMenu: def.deviceMenu || null,
+            width: 140,
+            height: Math.max(170, half * 26),
+            top: [],
+            right: right,
+            bottom: [],
+            left: left
+        };
+    }
+
     return {
         name: def.name || '自定义器件',
         title: title,

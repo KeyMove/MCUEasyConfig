@@ -209,10 +209,15 @@ let nodeSystem = {
                     openCustomDeviceMenu(e, node);
                 }
             } else if (node.config && node.config.device) {
-                // MCU 设备：右键打开「该 MCU 对应的 SVD 寄存器」编辑器（按 MCU 大类名称自动匹配 SVD key，封装继承）
+                // MCU 设备：右键打开「该 MCU 对应的 SVD 寄存器」编辑器。
+                // 优先用 device 显式绑定的 SVD key（在设备编辑器下拉框里指定），
+                // 其次按 MCU 大类名称自动匹配（resolveSvdKeyForDevice，封装继承同一 SVD）。
                 e.preventDefault();
-                const key = (window.SvdLib && typeof window.SvdLib.resolveSvdKeyForDevice === 'function')
-                    ? window.SvdLib.resolveSvdKeyForDevice(node.config.device) : '';
+                const dev = node.config.device;
+                let key = (dev && dev.svdKey && dev.svdKey !== '__auto__') ? dev.svdKey : '';
+                if (!key && window.SvdLib && typeof window.SvdLib.resolveSvdKeyForDevice === 'function') {
+                    key = window.SvdLib.resolveSvdKeyForDevice(dev);
+                }
                 if (typeof window.openSvdWindow === 'function') {
                     if (key) window.openSvdWindow(key);
                     else window.openSvdWindow();  // 未匹配到 → 退化为全局激活 SVD
@@ -224,6 +229,58 @@ let nodeSystem = {
         this.triggerCallback('onNodeChange', { type: 'create', nodeId });
 
         return nodeId;
+    },
+
+    /**
+     * 生成一个「自定义 MCU 设备」的多个封装节点（参考 config 的 mcu.packages 结构）。
+     * def.packages 为封装数组，每个含 { name, packageType, pins:[{label,port}] }，
+     * 共享顶层 af / special / gpio。每个封装生成一个独立设备节点（错开摆放）。
+     * @param {Object} def  { name, packages:[...], af, special, gpio }
+     * @returns {string[]} 生成的节点 id 列表
+     */
+    addCustomDeviceSet(def) {
+        const pkgs = (def && def.packages) || [];
+        if (!pkgs.length) return [];
+        const mcuName = def.name || '自定义设备';
+        const shared = {
+            af: def.af || null,
+            special: def.special || null,
+            gpio: def.gpio || null
+        };
+        const containerRect = this.container.getBoundingClientRect();
+        const ids = [];
+        const cols = Math.ceil(Math.sqrt(pkgs.length));
+        pkgs.forEach((pkg, i) => {
+            const single = {
+                name: pkg.name || (pkgs.length === 1 ? mcuName : `${mcuName} (${pkg.packageType || 'PKG'})`),
+                packageType: pkg.packageType || 'SOP',
+                pins: pkg.pins || [],
+                af: shared.af,
+                special: shared.special,
+                gpio: shared.gpio
+            };
+            const config = buildCustomDevice(single);
+            const col = i % cols, row = Math.floor(i / cols);
+            const x = Math.max(40, (containerRect.width - config.width) / 2 + col * 180 - (cols - 1) * 90 + (Math.random() * 40 - 20));
+            const y = Math.max(40, (containerRect.height - config.height) / 2 + row * 220 - (Math.ceil(pkgs.length / cols) - 1) * 110 + (Math.random() * 40 - 20));
+            const nodeId = this.createNode(config, x, y);
+            const node = this.nodes.get(nodeId);
+            if (node) {
+                ['left', 'right', 'top', 'bottom'].forEach(side => {
+                    const len = (node.config && node.config[side] ? node.config[side].length : 0);
+                    for (let idx = 0; idx < len; idx++) {
+                        const fns = (typeof node.getPadFunctions === 'function') ? node.getPadFunctions(side, idx) : [];
+                        const inFn = fns.find(f => (typeof isGpioInput === 'function') ? isGpioInput(f) : false);
+                        if (inFn) {
+                            const pull = (typeof gpioInputPull === 'function') ? gpioInputPull(inFn) : 0;
+                            node.setIoRegs(side, idx, { mode: 0, otype: 0, pupd: pull });
+                        }
+                    }
+                });
+            }
+            ids.push(nodeId);
+        });
+        return ids;
     },
 
     startConnection(e, padElement) {
@@ -1104,6 +1161,14 @@ let nodeSystem = {
 
     getInterfaceFunctions() { return this.interfaceFunctions || []; },
 
+    /** 按 SVD 型号过滤接口函数定义（规则同 getInterfaceInitsForSvd：空=全部，指定=通用+该型号）。 */
+    getInterfaceFunctionsForSvd(svdKey) {
+        const list = this.interfaceFunctions || [];
+        const k = (svdKey || '').trim();
+        if (!k) return list;
+        return list.filter(d => !d.svdKey || d.svdKey === k);
+    },
+
     getInterfaceFunctionByName(name) {
         if (!name) return null;
         const nm = String(name).trim();
@@ -1111,11 +1176,12 @@ let nodeSystem = {
     },
 
     /** 新建或覆盖某个接口函数定义（按第 1 行管理名去重；不同管理名可共存，便于 & 条件筛选下多定义并存） */
-    upsertInterfaceFunction(name, raw) {
+    upsertInterfaceFunction(name, raw, svdKey) {
         const parsed = this.parseInterfaceFunction(raw);
         const nm = (parsed.name || name || '').trim();
         if (!nm) return null;
-        const rec = { name: nm, names: parsed.names, required: parsed.required, defaults: parsed.defaults, raw: raw.replace(/\r\n/g, '\n'), code: parsed.code, replaceMap: parsed.replaceMap || [] };
+        // svdKey 为空 → 记为“通用定义”，在任何型号下都可见（便于相似 MCU 间移植）
+        const rec = { name: nm, names: parsed.names, required: parsed.required, defaults: parsed.defaults, raw: raw.replace(/\r\n/g, '\n'), code: parsed.code, replaceMap: parsed.replaceMap || [], svdKey: (svdKey || '').trim() };
         const idx = this.interfaceFunctions.findIndex(d => d.name === nm);
         if (idx >= 0) this.interfaceFunctions[idx] = rec;
         else this.interfaceFunctions.push(rec);
@@ -1139,36 +1205,120 @@ let nodeSystem = {
      *  硬件/信号命中路径：每个 def 输出一段（不含引脚）；
      *  强制(@)路径：每个器件实例输出一段，引脚经 {{CS}}/{{SCK}}/{{MOSI}}/{{MISO}}/{{SCL}}/{{SDA}}/{{DEV}}/{{IDX}} 替换。 */
     getUsedInterfaceFunctionCodes() {
-        const blocks = [];
-        for (const d of (this.usedFuncDefs || [])) {
-            const c = (d.code || '').trim();
-            if (c) blocks.push(c);
-        }
-        for (const inst of (this.usedInstances || [])) {
-            for (const d of (inst.defs || [])) {
-                const c = (d.code || '').trim();
-                if (!c) continue;
-                const sub = this.substituteInstanceCode(c, inst, d.replaceMap);
-                blocks.push('// === ' + inst.deviceName + '_' + inst.idx + ' (' + (d.name || '?') + ') ===\n' + sub);
-            }
-        }
-        return blocks;
+        return this._getFuncCodes(this.usedFuncDefs, this.usedInstances);
     },
 
     /**
      * 生成“程序段”导出文本：首行注释汇总已使用外设，随后按命中顺序整段输出各接口函数代码。
      * @returns {string}
      */
-    computeFunctionDump() {
+    /** 为指定 SVD 型号（MCU）收集其连接上出现的接口信号名集合（含同义词展开）。
+     *  用于「程序段导出 / 接口函数」按 MCU 型号过滤：仅输出该型号 MCU 连接触发的函数段。
+     *  @param {string} svdKey 目标 MCU 的 SVD key（与 getNodeSvdKey 一致）
+     *  @returns {Set<string>} 信号名集合 */
+    _collectSvdNames(svdKey) {
+        const names = new Set();
+        const gpioNames = new Set();
+        const addNameTo = (set, nm) => {
+            if (!nm) return;
+            for (const e of this.expandSignalName(nm)) set.add(e);
+        };
+        const resolveSvd = (node) => {
+            if (node && node.config && node.config.device) {
+                const k = window.SvdLib && window.SvdLib.resolveSvdKeyForDevice
+                    ? window.SvdLib.resolveSvdKeyForDevice(node.config.device) : null;
+                return k || null;
+            }
+            return null;
+        };
+        this.connections.forEach(conn => {
+            const ends = [conn.source, conn.target];
+            const mcuEnd = ends.find(e => { const n = this.nodes.get(e.nodeId); return n && n.config && n.config.device; });
+            if (!mcuEnd) return;
+            const mcuNode = this.nodes.get(mcuEnd.nodeId);
+            if (resolveSvd(mcuNode) !== svdKey) return; // 仅收集归属目标型号的 MCU 连接
+            const isSim = (() => {
+                const n = mcuNode;
+                const afFn = (n.af && typeof n.af.get === 'function') ? n.af.get(`${mcuEnd.port}-${mcuEnd.index}`) : null;
+                const hasGpio = (typeof n.getSpecialFunctions === 'function')
+                    ? n.getSpecialFunctions(mcuEnd.port, mcuEnd.index).some(f => f === 'GPIO_OUT' || (typeof isGpioInput === 'function' && isGpioInput(f)))
+                    : false;
+                return (!afFn || !afFn.id) && hasGpio;
+            })();
+            const targetSet = isSim ? gpioNames : names;
+            for (const end of ends) {
+                const n = this.nodes.get(end.nodeId);
+                if (!n || !n.config) continue;
+                if (n.config.device) {
+                    if (isSim) {
+                        if (typeof n.getSpecialFunctions === 'function') {
+                            n.getSpecialFunctions(end.port, end.index).forEach(f => {
+                                const u = String(f).toUpperCase();
+                                if (u === 'GPIO_OUT' || u === 'GPIO_IN' || u === 'GPIO_INPU' || u === 'GPIO_INPD') {
+                                    addNameTo(targetSet, u);
+                                    if (u === 'GPIO_INPU' || u === 'GPIO_INPD') addNameTo(targetSet, 'GPIO_IN');
+                                }
+                            });
+                        }
+                    } else {
+                        if (n.af && typeof n.af.get === 'function') {
+                            const fn = n.af.get(`${end.port}-${end.index}`);
+                            if (fn && fn.id) addNameTo(targetSet, String(fn.id));
+                        }
+                        if (typeof n.getSpecialFunctions === 'function') {
+                            n.getSpecialFunctions(end.port, end.index).forEach(f => addNameTo(targetSet, String(f)));
+                        }
+                    }
+                } else {
+                    const sig = (typeof n.getPadSignal === 'function') ? n.getPadSignal(end.port, end.index) : null;
+                    if (sig) addNameTo(targetSet, String(sig));
+                    if (typeof n.getSpecialFunctions === 'function') {
+                        n.getSpecialFunctions(end.port, end.index).forEach(f => addNameTo(targetSet, String(f)));
+                    }
+                    const idef = n.config && n.config.iface;
+                    if (idef) {
+                        const list = Array.isArray(idef) ? idef : [idef];
+                        list.forEach(x => { const s = String(x); if (s.charAt(0) === '@') addNameTo(targetSet, s.slice(1)); else addNameTo(targetSet, s); });
+                    }
+                }
+            }
+        });
+        return names;
+    },
+
+    /**
+     * 生成“程序段”导出文本：首行注释汇总已使用外设，随后按命中顺序整段输出各接口函数代码。
+     * @param {string} [svdKey] 可选，指定 MCU 型号 → 仅输出该型号连接触发的函数段（与接口初始化绑定型号一致）。
+     * @returns {string}
+     */
+    computeFunctionDump(svdKey) {
+        // 按型号过滤：仅保留被目标 MCU 连接命中的函数定义 / 实例
+        let usedFuncDefs = this.usedFuncDefs || [];
+        let usedInstances = this.usedInstances || [];
+        let forcedNames = null;
+        if (svdKey) {
+            const keyNames = this._collectSvdNames(svdKey);
+            forcedNames = keyNames;
+            usedFuncDefs = usedFuncDefs.filter(d => this.defMatches(d, keyNames));
+            const matchedNames = new Set(usedFuncDefs.map(d => d.name).concat(
+                usedFuncDefs.flatMap(d => d.names || [])));
+            usedInstances = usedInstances
+                .filter(inst => (inst.defs || []).some(d => this.defMatches(d, keyNames)))
+                .map(inst => Object.assign({}, inst, {
+                    defs: inst.defs.filter(d => this.defMatches(d, keyNames)
+                        || (inst.defNames || []).some(n => (d.name === n) || (d.names || []).includes(n)))
+                }));
+            void matchedNames;
+        }
         // 首行注释：汇总“已命中函数段（硬件 / 软件模拟共用同一池）”对应的外设实例
         const periSet = new Set();
-        for (const d of (this.usedFuncDefs || [])) {
+        for (const d of usedFuncDefs) {
             for (const a of (d.names || [])) {
                 const p = this.extractPeripheralName(a);
                 if (p) periSet.add(p);
             }
         }
-        for (const inst of (this.usedInstances || [])) {
+        for (const inst of usedInstances) {
             for (const d of (inst.defs || [])) {
                 for (const a of (d.names || [])) {
                     const p = this.extractPeripheralName(a);
@@ -1179,13 +1329,31 @@ let nodeSystem = {
         const peris = Array.from(periSet).sort();
         const head = '// ' + (peris.length ? peris.join(' ') : '(无已命中外设)');
 
-        const codes = this.getUsedInterfaceFunctionCodes();
+        const codes = this._getFuncCodes(usedFuncDefs, usedInstances);
         if (!codes.length) {
-            return head + '\n\n（无已命中的接口函数：请先在「接口函数定义」中定义，并连上对应接口（或用具 @接口名 声明强制选择）后点「应用到当前连接」）';
+            return head + '\n\n（无已命中的接口函数' + (svdKey ? '（型号 ' + svdKey + '）' : '') + '：请先在「接口函数定义」中定义，并连上对应接口（或用具 @接口名 声明强制选择）后点「应用到当前连接」）';
         }
 
         // 软件模拟与硬件共用同一池，统一整段输出（无需分小节）；@ 强制选择的段也在此列出。
         return [head].concat(codes).join('\n\n') + '\n';
+    },
+
+    /** 按给定的 usedFuncDefs / usedInstances 生成代码块数组（computeFunctionDump 与按型号过滤共用）。 */
+    _getFuncCodes(usedFuncDefs, usedInstances) {
+        const blocks = [];
+        for (const d of (usedFuncDefs || [])) {
+            const c = (d.code || '').trim();
+            if (c) blocks.push(c);
+        }
+        for (const inst of (usedInstances || [])) {
+            for (const d of (inst.defs || [])) {
+                const c = (d.code || '').trim();
+                if (!c) continue;
+                const sub = this.substituteInstanceCode(c, inst, d.replaceMap);
+                blocks.push('// === ' + inst.deviceName + '_' + inst.idx + ' (' + (d.name || '?') + ') ===\n' + sub);
+            }
+        }
+        return blocks;
     },
 
     persistSvdRegValues() {
@@ -1359,6 +1527,16 @@ let nodeSystem = {
 
     getInterfaceInits() { return this.interfaceInits || []; },
 
+    /** 按 SVD 型号过滤接口初始化定义：
+     *  svdKey 为空（全局）→ 返回全部（便于查看/移植）；
+     *  指定型号 → 仅返回“未标注归属（通用，可移植）”与“归属该型号”的定义。 */
+    getInterfaceInitsForSvd(svdKey) {
+        const list = this.interfaceInits || [];
+        const k = (svdKey || '').trim();
+        if (!k) return list;
+        return list.filter(d => !d.svdKey || d.svdKey === k);
+    },
+
     getInterfaceInitByName(name) {
         if (!name) return null;
         const nm = String(name).trim();
@@ -1366,11 +1544,12 @@ let nodeSystem = {
     },
 
     /** 新建或覆盖某个接口初始化定义（按第 1 行管理名去重；不同管理名可共存，便于 & 条件筛选下多定义并存） */
-    upsertInterfaceInit(name, raw) {
+    upsertInterfaceInit(name, raw, svdKey) {
         const parsed = this.parseInterfaceInit(raw);
         const nm = (parsed.name || name || '').trim();
         if (!nm) return null;
-        const rec = { name: nm, names: parsed.names, required: parsed.required, defaults: parsed.defaults, raw: raw.replace(/\r\n/g, '\n'), entries: parsed.entries };
+        // svdKey 为空 → 记为“通用定义”，在任何型号下都可见（便于相似 MCU 间移植）
+        const rec = { name: nm, names: parsed.names, required: parsed.required, defaults: parsed.defaults, raw: raw.replace(/\r\n/g, '\n'), entries: parsed.entries, svdKey: (svdKey || '').trim() };
         const idx = this.interfaceInits.findIndex(d => d.name === nm);
         if (idx >= 0) this.interfaceInits[idx] = rec;
         else this.interfaceInits.push(rec);
@@ -1429,6 +1608,13 @@ let nodeSystem = {
     _svdActiveMap() {
         this.svdRegValues = this.svdRegValues || {};
         const k = this._svdActiveKey();
+        if (!this.svdRegValues[k]) this.svdRegValues[k] = {};
+        return this.svdRegValues[k];
+    },
+    /** 指定 svdKey 的寄存器值子表（多 MCU 隔离），保证存在并返回。 */
+    _svdMap(key) {
+        this.svdRegValues = this.svdRegValues || {};
+        const k = key || this._svdActiveKey();
         if (!this.svdRegValues[k]) this.svdRegValues[k] = {};
         return this.svdRegValues[k];
     },
@@ -1762,10 +1948,12 @@ let nodeSystem = {
      * @param {string} raw 接口初始化原始文本（首行=接口名，后续 地址,值）
      * @returns {{ok:boolean, msg?:string, count?:number}}
      */
-    applyInterfaceInitToSvd(raw) {
+    applyInterfaceInitToSvd(raw, svdKey) {
         const r = this.parseInterfaceInit(this.toNewFormatRaw(raw));
         if (!r.name) return { ok: false, msg: '第 1 行必须为名称（如 通用SPI）' };
         const name = r.name;
+        // 目标 SVD 命名空间：显式指定（面板底部选择器）优先，否则回退当前激活 SVD
+        const targetKey = svdKey || this._svdActiveKey();
 
         // 1. 清除本接口此前写入的 iface 条目（svdRegValues + 逐行记录 + id 列表，跨所有 svdKey）
         const svdAll = this.svdRegValues || {};
@@ -1784,9 +1972,9 @@ let nodeSystem = {
             return false;
         });
 
-        // 2. 生成本接口各 (addr,value) 的逐行记录（同地址多行保留，如先赋值再使能），写入当前激活 SVD 命名空间。
+        // 2. 生成本接口各 (addr,value) 的逐行记录（同地址多行保留，如先赋值再使能），写入目标 SVD 命名空间（按 svdKey 隔离）。
         //    同一地址只保留“最后一行”的值（last-wins），手动编辑基值仍与之 OR 保留。
-        const svdMap = this._svdActiveMap();
+        const svdMap = this._svdMap(targetKey);
         const lines = this._makeIfaceLines(r.entries, name);
         const lastByReg = {}; // regId -> 最后出现的 line（本接口内部 last-wins）
         for (const ln of lines) lastByReg[ln.regId] = ln;
@@ -1828,9 +2016,10 @@ let nodeSystem = {
      * @param {string} raw 当前接口初始化原始文本
      * @returns {{ok:boolean, msg?:string, raw?:string}}
      */
-    loadInterfaceInitFromSvd(raw) {
+    loadInterfaceInitFromSvd(raw, svdKey) {
         const r = this.parseInterfaceInit(this.toNewFormatRaw(raw));
         if (!r.name) return { ok: false, msg: '第 1 行必须为名称（如 通用SPI）', raw: null };
+        const targetKey = svdKey || this._svdActiveKey();
         const idx = this.buildRegAddressIndex();
         const hx = (v) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
         // 第 1 行还原为管理名；第 2 行还原为别名行（保留 & 条件前缀）；第 3 行起为 地址,值
@@ -1845,7 +2034,7 @@ let nodeSystem = {
             const info = idx.get(key);
             let curVal = ent.value >>> 0;
             if (info) {
-                const stored = this._svdActiveMap()[info.regId];
+                const stored = this._svdMap(targetKey)[info.regId];
                 curVal = stored ? (stored.value >>> 0) : (info.reset >>> 0);
             }
             lines.push(hx(ent.addr) + ',' + hx(curVal) + ',');
@@ -2698,6 +2887,58 @@ let nodeSystem = {
             });
         }
         return nodeId;
+    },
+
+    /**
+     * 生成一个「自定义 MCU 设备」的多个封装节点（参考 config 的 mcu.packages 结构）。
+     * def.packages 为封装数组，每个含 { name, packageType, pins:[{label,port}] }，
+     * 共享顶层 af / special / gpio。每个封装生成一个独立设备节点（错开摆放）。
+     * @param {Object} def  { name, packages:[...], af, special, gpio }
+     * @returns {string[]} 生成的节点 id 列表
+     */
+    addCustomDeviceSet(def) {
+        const pkgs = (def && def.packages) || [];
+        if (!pkgs.length) return [];
+        const mcuName = def.name || '自定义设备';
+        const shared = {
+            af: def.af || null,
+            special: def.special || null,
+            gpio: def.gpio || null
+        };
+        const containerRect = this.container.getBoundingClientRect();
+        const ids = [];
+        const cols = Math.ceil(Math.sqrt(pkgs.length));
+        pkgs.forEach((pkg, i) => {
+            const single = {
+                name: pkg.name || (pkgs.length === 1 ? mcuName : `${mcuName} (${pkg.packageType || 'PKG'})`),
+                packageType: pkg.packageType || 'SOP',
+                pins: pkg.pins || [],
+                af: shared.af,
+                special: shared.special,
+                gpio: shared.gpio
+            };
+            const config = buildCustomDevice(single);
+            const col = i % cols, row = Math.floor(i / cols);
+            const x = Math.max(40, (containerRect.width - config.width) / 2 + col * 180 - (cols - 1) * 90 + (Math.random() * 40 - 20));
+            const y = Math.max(40, (containerRect.height - config.height) / 2 + row * 220 - (Math.ceil(pkgs.length / cols) - 1) * 110 + (Math.random() * 40 - 20));
+            const nodeId = this.createNode(config, x, y);
+            const node = this.nodes.get(nodeId);
+            if (node) {
+                ['left', 'right', 'top', 'bottom'].forEach(side => {
+                    const len = (node.config && node.config[side] ? node.config[side].length : 0);
+                    for (let idx = 0; idx < len; idx++) {
+                        const fns = (typeof node.getPadFunctions === 'function') ? node.getPadFunctions(side, idx) : [];
+                        const inFn = fns.find(f => (typeof isGpioInput === 'function') ? isGpioInput(f) : false);
+                        if (inFn) {
+                            const pull = (typeof gpioInputPull === 'function') ? gpioInputPull(inFn) : 0;
+                            node.setIoRegs(side, idx, { mode: 0, otype: 0, pupd: pull });
+                        }
+                    }
+                });
+            }
+            ids.push(nodeId);
+        });
+        return ids;
     },
 
     toggleDeleteButtons(hide) {

@@ -38,24 +38,24 @@
         },
         "reset": {
           "MODE": {
-            "A": 65519,
-            "B": 61439,
-            "C": 15
+            "A": "0x0000FFEF",
+            "B": "0x0000EFFF",
+            "C": "0x0000000F"
           },
           "PUPD": {
-            "A": 32,
-            "B": 4096,
-            "C": 0
+            "A": "0x00000020",
+            "B": "0x00001000",
+            "C": "0x00000000"
           },
           "OTYPE": {
-            "A": 0,
-            "B": 0,
-            "C": 0
+            "A": "0x00000000",
+            "B": "0x00000000",
+            "C": "0x00000000"
           },
           "AFL": {
-            "A": 0,
-            "B": 0,
-            "C": 0
+            "A": "0x00000000",
+            "B": "0x00000000",
+            "C": "0x00000000"
           }
         }
       },
@@ -1232,8 +1232,10 @@
         if (!obj || typeof obj !== 'object') return false;
         writeOverlay(obj);                       // 关键：手动加载后持久化到 localStorage
         applyConfig(obj);
-        // 同步收藏夹到独立键，供收藏夹 UI 直接读取
+        // 同步收藏夹到独立键，供收藏夹 UI 直接读取（MCU 设备收藏夹 / 外设收藏夹 分开）
         if (obj.favorites) { try { localStorage.setItem('pinDeviceFavorites', JSON.stringify(obj.favorites)); } catch (e) {} }
+        if (obj.peripheralFavorites) { try { localStorage.setItem('pinPeripheralFavorites', JSON.stringify(obj.peripheralFavorites)); } catch (e) {} }
+        if (typeof window.migrateFavorites === 'function') window.migrateFavorites();
         if (typeof window.refreshFavUI === 'function') window.refreshFavUI();
         window.dispatchEvent(new Event('appconfigimported'));
         if (typeof nodeSystem !== 'undefined' && nodeSystem && nodeSystem.updateConnectionStatus) {

@@ -378,13 +378,46 @@ class RichMenu {
 .rm-btn-danger { background: #ef4444; color: #fff; }
 .rm-btn-danger:hover { background: #dc2626; }
 
-/* ===== 布局：Grid ===== */
-.rm-layout-grid .rm-section-controls {
+/* ===== 布局：Grid =====
+   .rm-layout-grid 既可能在面板根（整体 grid 布局），也可能直接加在
+   .rm-section-controls 上（section 级 grid）。两种写法都要生效。 */
+.rm-layout-grid .rm-section-controls,
+.rm-section-controls.rm-layout-grid {
     display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px;
 }
-.rm-layout-grid .rm-control { margin-bottom: 0; }
-.rm-layout-grid .rm-control.rm-span-full { grid-column: 1 / -1; }
-.rm-layout-grid .rm-control-btn { width: 100%; }
+/* 只作用于网格直接子项，避免影响 .rm-row 里的嵌套控件 */
+.rm-layout-grid .rm-section-controls > .rm-control,
+.rm-section-controls.rm-layout-grid > .rm-control { margin-bottom: 0; }
+.rm-layout-grid .rm-section-controls > .rm-span-full,
+.rm-section-controls.rm-layout-grid > .rm-span-full { grid-column: 1 / -1; }
+.rm-layout-grid .rm-section-controls > .rm-control.rm-span-half,
+.rm-section-controls.rm-layout-grid > .rm-control.rm-span-half { grid-column: span 1; }
+.rm-layout-grid .rm-control-btn,
+.rm-section-controls.rm-layout-grid .rm-control-btn { width: 100%; }
+/* heading / divider 不经 rm-control 包裹，需显式占满整行，否则会挤占半格打乱按钮配对 */
+.rm-layout-grid .rm-section-controls > .rm-heading,
+.rm-section-controls.rm-layout-grid > .rm-heading,
+.rm-layout-grid .rm-section-controls > .rm-divider,
+.rm-section-controls.rm-layout-grid > .rm-divider { grid-column: 1 / -1; }
+
+/* ===== 混合布局：行容器 rm-row =====
+   标了相同 row 的连续控件被收进这里横向并排，
+   其余控件仍按 section 原布局（vertical/grid）排列 —— 即 grid + vertical 混合。 */
+.rm-row { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 14px; }
+.rm-row > .rm-control { flex: 1; margin-bottom: 0; min-width: 0; }
+.rm-row > .rm-control .rm-control-btn { width: 100%; }
+/* 行容器在 grid 中占满整行，内部再自行等分 */
+.rm-layout-grid .rm-section-controls > .rm-row,
+.rm-section-controls.rm-layout-grid > .rm-row { grid-column: 1 / -1; margin-bottom: 0; }
+
+/* span:'half' —— 在非 grid（如默认 vertical）的 section 里也能两两并排 */
+.rm-section-controls:not(.rm-layout-grid) > .rm-control.rm-span-half {
+    display: inline-block; width: calc(50% - 5px); vertical-align: top;
+}
+.rm-section-controls:not(.rm-layout-grid) > .rm-control.rm-span-half + .rm-control.rm-span-half {
+    margin-left: 8px;
+}
+.rm-control.rm-span-half .rm-control-btn { width: 100%; }
 
 /* ===== 布局：Tabs ===== */
 .rm-tabs-nav {
@@ -721,14 +754,10 @@ class RichMenu {
             if (String(key) === String(activeKey)) panel.classList.add('active');
 
             // section controls (no title needed in tab)
+            // 注意：tabs 布局不走 _createSection，故 section 级 layout（如 'grid'）
+            // 必须在此单独应用，否则 Tab 内的 grid/混合布局会完全失效。
             if (section.controls && section.controls.length > 0) {
-                const controlsWrap = document.createElement('div');
-                controlsWrap.className = 'rm-section-controls';
-                section.controls.forEach(ctrl => {
-                    const el = this._createControl(ctrl);
-                    if (el) controlsWrap.appendChild(el);
-                });
-                panel.appendChild(controlsWrap);
+                panel.appendChild(this._buildControlsWrap(section));
             }
             panels.appendChild(panel);
         });
@@ -754,10 +783,9 @@ class RichMenu {
             sectionEl.classList.add('rm-has-floating');
         }
 
-        // Section级别grid支持：仅让本 section 的控件使用网格布局（提高按钮密度），不污染其余 section
-        if (section.layout === 'grid') {
-            sectionEl.classList.add('rm-layout-grid');
-        }
+        // Section 级 layout（grid/twocolumn）现由 _buildControlsWrap 直接加在
+        // .rm-section-controls 上（与 tabs 布局共用同一套逻辑），此处不再重复添加，
+        // 避免祖先与容器双重命中 .rm-layout-grid 后代选择器导致嵌套行内控件被误当作网格项。
 
         if (c.layout === 'accordion') {
             // accordion mode
@@ -781,13 +809,7 @@ class RichMenu {
             });
 
             if (section.controls && section.controls.length > 0) {
-                const controlsWrap = document.createElement('div');
-                controlsWrap.className = 'rm-section-controls';
-                section.controls.forEach(ctrl => {
-                    const el = this._createControl(ctrl);
-                    if (el) controlsWrap.appendChild(el);
-                });
-                body.appendChild(controlsWrap);
+                body.appendChild(this._buildControlsWrap(section));
             }
 
             sectionEl.appendChild(header);
@@ -809,17 +831,61 @@ class RichMenu {
             }
 
             if (section.controls && section.controls.length > 0) {
-                const controlsWrap = document.createElement('div');
-                controlsWrap.className = 'rm-section-controls';
-                section.controls.forEach(ctrl => {
-                    const el = this._createControl(ctrl);
-                    if (el) controlsWrap.appendChild(el);
-                });
-                sectionEl.appendChild(controlsWrap);
+                sectionEl.appendChild(this._buildControlsWrap(section));
             }
         }
 
         return sectionEl;
+    }
+
+    /**
+     * 构建 section 的控件容器，统一支持「混合布局」。
+     * 被 _createSection（vertical/grid/twocolumn/accordion）与 _generateTabsLayout 共用，
+     * 保证任何布局模式下混合规则表现一致。
+     *
+     * 两种混合方式（可同时使用）：
+     *  1) section.layout='grid' + 控件 span:'full' —— 整体两列，个别控件占满整行；
+     *  2) 控件 row:'xxx' —— 无论 section 是什么布局，连续且 row 值相同的控件会被
+     *     收进一个 .rm-row 行容器内并排显示，其余控件保持原布局（纵向）。
+     *     这就是 grid + vertical 的混合：只有标了 row 的那一小段变横排。
+     */
+    _buildControlsWrap(section) {
+        const wrap = document.createElement('div');
+        wrap.className = 'rm-section-controls';
+        if (section.layout === 'grid') wrap.classList.add('rm-layout-grid');
+        if (section.layout === 'twocolumn') wrap.classList.add('rm-layout-twocolumn');
+
+        const controls = section.controls || [];
+        let i = 0;
+        while (i < controls.length) {
+            const cur = controls[i];
+            const rowKey = cur && cur.row;
+            if (!rowKey) {
+                const el = this._createControl(cur);
+                if (el) wrap.appendChild(el);
+                i++;
+                continue;
+            }
+            // 收集连续同 row 的控件，放进一个横向行容器
+            const group = [];
+            while (i < controls.length && controls[i] && controls[i].row === rowKey) {
+                group.push(controls[i]);
+                i++;
+            }
+            const rowEl = document.createElement('div');
+            rowEl.className = 'rm-row';
+            // 行内自身占满父 grid 整行，避免行容器只占半格
+            rowEl.classList.add('rm-span-full');
+            group.forEach(g => {
+                const el = this._createControl(g);
+                if (!el) return;
+                // 行内各控件默认等分；可用 flex 数字指定占比
+                if (g.flex !== undefined) el.style.flex = String(g.flex);
+                rowEl.appendChild(el);
+            });
+            wrap.appendChild(rowEl);
+        }
+        return wrap;
     }
 
     // ==================== 控件创建 ====================
@@ -1413,6 +1479,10 @@ class RichMenu {
     _createControlButton(ctrl) {
         const wrap = document.createElement('div');
         wrap.className = 'rm-control';
+        // 与其余控件一致地支持 span：'full' 占满整行，'half'（或不写）在 grid 布局下自然两两并排。
+        // 缺了这句会导致 grid 布局里按钮无法与相邻按钮同行显示。
+        if (ctrl.span === 'full') wrap.classList.add('rm-span-full');
+        if (ctrl.span === 'half') wrap.classList.add('rm-span-half');
         if (ctrl.floating) wrap.classList.add('rm-floating');
         const btn = document.createElement('button');
         btn.className = `rm-control-btn ${ctrl.style || 'primary'}`;
@@ -1427,6 +1497,8 @@ class RichMenu {
             btn.addEventListener('click', () => ctrl.onClick(this.getValues()));
         }
         wrap.appendChild(btn);
+        // 保存按钮引用，便于外部（如 swdSetOpenState）通过 menuControls[id] 修改文字/状态
+        this.menuControls[ctrl.id] = btn;
         return wrap;
     }
 
