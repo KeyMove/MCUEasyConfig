@@ -1739,12 +1739,16 @@
 
     var mcuchain=null;
     var mcuchainlast=null;
-    var swdconnect=false;
-    var swdopen=false;
+    // 连接状态直接复用 comm.js 维护的全局状态（SWD 设备打开/连接由底层 status 回调驱动，
+    // swdSetOpenState 更新 __swdOpen / __swdConnect）。旧代码里 swd.js 自有的局部 swdopen/swdconnect
+    // 从不随 comm.js 的连接流程更新，导致右键菜单的 mcuR32/mcuW32 在 if(!swdopen)return 处直接返回、
+    // 读写永远不生效。这里改为读取全局状态，保证右键读写能真正工作。
+    function _swdOpen(){ return !!(window.__swdOpen); }
+    function _swdConnect(){ return !!(window.__swdConnect); }
     
     function mcuR32(addr, call) {
-        if(!swdopen)return;
-        if (!swdconnect) mcuConnect();
+        if(!_swdOpen())return;
+        if (!_swdConnect()) mcuConnect();
         if (!mcuchainlast) {
             // 初始化队列
             mcuchain = mcuchainlast = Promise.resolve()
@@ -1760,8 +1764,8 @@
         }
     }
     function mcuW32(addr,value){
-        if(!swdopen)return;
-        if (!swdconnect) mcuConnect();
+        if(!_swdOpen())return;
+        if (!_swdConnect()) mcuConnect();
         if (!mcuchainlast) {
             // 初始化队列
             mcuchain = mcuchainlast = Promise.resolve()
@@ -1776,9 +1780,12 @@
         return `0x${Hex32(addr)}=${value}`;
     }
     function mcuConnect(){
-        if(!swdopen)return;
-        if (swdconnect)return;
-        swdconnect=true;
+        if(!_swdOpen())return;
+        if (_swdConnect())return;
+        // 连接建立：同步更新 comm.js 维护的全局状态（comm.js 在 swd.js 之后加载，
+        // 运行期可直接引用其裸名；同时写 window 以保证跨文件一致）
+        if (typeof __swdConnect !== 'undefined') __swdConnect = true;
+        window.__swdConnect = true;
         if (!mcuchainlast) {
             // 初始化队列
             mcuchain = mcuchainlast = Promise.resolve()

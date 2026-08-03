@@ -608,7 +608,7 @@ document.addEventListener('DOMContentLoaded', function () {
         win.setContent(wrap);
 
         // 编辑器（放到窗口关闭时一并销毁，避免泄漏）
-        const editor = new RichObjectEditor(roeHost, { hideTypeBadge: false, hideAddRoot: false });
+        const editor = new RichObjectEditor(roeHost, { hideTypeBadge: false, hideAddRoot: false, hideCell: true });
         editor.setObj(skeleton.data, editorSchema);
         // 默认展开根 / packages（含首个封装的 pins）/ af / special，方便直接查看
         editor.expandedPaths.add(JSON.stringify([]));
@@ -1231,11 +1231,19 @@ document.addEventListener('DOMContentLoaded', function () {
             overlay.id = 'fsModalOverlay';
             // 优先挂在 dock 菜单面板内部：点按钮时 e.target 仍在面板内 → 菜单不会被外部点击关闭。
             // 面板为 position:fixed（transform 不影响 absolute 的包含块），用 absolute;inset:0 限制在菜单范围内。
-            const host = (dockMenu && dockMenu.element) ? dockMenu.element : document.body;
-            const insideMenu = host !== document.body;
-            overlay.style.cssText = (insideMenu ? 'position:absolute;inset:0;' : 'position:fixed;inset:0;') +
-                'background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:9999;' +
-                'font-family:system-ui,-apple-system,sans-serif;';
+        const host = (dockMenu && dockMenu.element) ? dockMenu.element : document.body;
+        const insideMenu = host !== document.body;
+        // 动态 z-index：永远盖在置顶的 MacWindow 之上（MacWindow._topZ 从 10000 递增）
+        let _topZ = 100000;
+        try { if (typeof MacWindow !== 'undefined' && MacWindow._topZ) _topZ = Math.max(_topZ, MacWindow._topZ); } catch (e) {}
+        document.querySelectorAll('.mac-window').forEach(el => {
+            const z = parseInt(el.style.zIndex || '', 10);
+            if (!isNaN(z) && z > _topZ) _topZ = z;
+        });
+        const _modalZ = _topZ + 1;
+        overlay.style.cssText = (insideMenu ? 'position:absolute;inset:0;' : 'position:fixed;inset:0;') +
+            'background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:' + _modalZ + ';' +
+            'font-family:system-ui,-apple-system,sans-serif;';
             const box = document.createElement('div');
             box.style.cssText = 'background:#1e293b;border:1px solid #475569;border-radius:10px;padding:20px;width:calc(100% - 32px);max-width:340px;max-height:calc(100% - 32px);overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
             const h = document.createElement('div');
@@ -1406,6 +1414,29 @@ SPI1_CLK SPI1_MOSI SPI1_MISO
 void {{DEV}}_{{IDX}}_init(void){
   GPIO_DIR(SPI_CS, OUT);   // SPI_CS → 本实例真实 CS 引脚(如 PA4)
   GPIO_DIR(SPI_CLK, OUT);  // SPI_CLK → SPI0_CLK / SPI1_CLK …
+}`;
+
+    // 运行模板：把收集到的“初始化寄存器值”与“接口函数”组合成完整程序。
+    // 通过特殊占位符替换（生成完整输出时填入）：
+    //   {{REG}}   → 寄存器变动值（来自「寄存器变动值」栏，地址升序）
+    //   {{FUNC}}  → 接口函数段（来自「程序段输出」栏，已按连接收集）
+    // 其余内容（如 main 框架、include）原样保留。
+    const RUN_TPL_STORE_KEY = 'runTemplate';
+    let _savedRunTpl = '';
+    try { _savedRunTpl = localStorage.getItem(RUN_TPL_STORE_KEY) || ''; } catch (e) {}
+    const DEFAULT_RUN_TPL = _savedRunTpl || `// ===== 运行模板：{{REG}} 与 {{FUNC}} 在「寄存器变动值/程序段输出 → 完整输出」里被替换 =====
+#include "driver.h"
+
+int main(void){
+    // --- 寄存器初始化（自动填充） ---
+{{REG}}
+
+    // --- 接口函数（自动填充） ---
+{{FUNC}}
+
+    while(1){
+        // 用户逻辑
+    }
 }`;
 
     // 自定义接口初始化参数面板（原生 tabs 卡项布局，参考 test menu 的 layout:'tabs' 设计）：
@@ -1584,6 +1615,24 @@ void {{DEV}}_{{IDX}}_init(void){
                             if (dockMenu && dockMenu.setValue) dockMenu.setValue('funcRaw', DEFAULT_FUNC_EXAMPLE);
                             // 删除函数定义后，立即重算以清除已被删除定义收集的函数段
                             nodeSystem.recomputeInterfaceInitRegisters();
+                        } }
+                    ]
+                },
+                {
+                    key: 'runTpl',
+                    title: '【运行模板定义】',
+                    controls: [
+                        { type: 'heading', label: '把「寄存器变动值」与「接口函数段」组合成完整程序的模板。用占位符替换：{{REG}} = 寄存器初始化值（地址升序）、{{FUNC}} = 接口函数段。在「寄存器变动值/程序段输出 → 完整输出」栏按模板生成完整程序（特殊字符替换）。模板自动保存到本地。', span: 'full' },
+                        { type: 'textarea', id: 'runTpl', label: '运行模板', value: DEFAULT_RUN_TPL, rows: 16, span: 'full' },
+                        { type: 'button', id: 'saveTpl', label: '保存模板', style: 'primary', row: 'tplOps', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['runTpl'] : null;
+                            if (!ta) return;
+                            try { localStorage.setItem(RUN_TPL_STORE_KEY, ta.value); } catch (e) {}
+                        } },
+                        { type: 'button', id: 'resetTpl', label: '恢复默认', style: 'secondary', row: 'tplOps', onClick: () => {
+                            // 清掉本地存储并回填默认模板
+                            try { localStorage.removeItem(RUN_TPL_STORE_KEY); } catch (e) {}
+                            if (dockMenu && dockMenu.setValue) dockMenu.setValue('runTpl', DEFAULT_RUN_TPL);
                         } }
                     ]
                 }
@@ -2013,6 +2062,35 @@ void {{DEV}}_{{IDX}}_init(void){
                             URL.revokeObjectURL(url);
                         } }
                     ]
+                },
+                {
+                    key: 'full',
+                    title: '完整输出',
+                    controls: [
+                        { type: 'heading', label: '按「运行模板定义」里的模板，把寄存器变动值与接口函数段经特殊字符替换组合成完整程序。点击「生成完整程序」重新组合（模板改动后需先在「接口初始化」面板保存）。', span: 'full' },
+                        { type: 'textarea', id: 'fullOut', label: '完整程序', value: '（点击「生成完整程序」）', readonly: true, rows: 14, span: 'full' },
+                        { type: 'button', id: 'fullGen', label: '生成完整程序', style: 'primary', row: 'fullOps', onClick: () => {
+                            nodeSystem.recomputeInterfaceInitRegisters();
+                            const reg = nodeSystem.computeRegisterDump();
+                            // 函数段：尊重「程序段输出」里的型号过滤（若有）
+                            const fsel = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['dumpSvd'] : null;
+                            const func = nodeSystem.computeFunctionDump(fsel ? fsel.value : '');
+                            // 读取运行模板（与「接口初始化」面板共用本地存储）
+                            let tpl = '';
+                            try { tpl = localStorage.getItem('runTemplate') || ''; } catch (e) {}
+                            if (!tpl) tpl = '// 未定义运行模板\n{{REG}}\n{{FUNC}}';
+                            // 特殊字符替换：{{REG}} → 寄存器变动值，{{FUNC}} → 接口函数段
+                            const out = tpl
+                                .split('{{REG}}').join(reg || '')
+                                .split('{{FUNC}}').join(func || '');
+                            if (dockMenu && dockMenu.setValue) dockMenu.setValue('fullOut', out);
+                        } },
+                        { type: 'button', id: 'fullCopy', label: '复制', style: 'secondary', row: 'fullOps', onClick: () => {
+                            const ta = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['fullOut'] : null;
+                            const text = ta ? ta.value : '';
+                            if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+                        } }
+                    ]
                 }
             ]
         };
@@ -2029,7 +2107,8 @@ void {{DEV}}_{{IDX}}_init(void){
         { emoji: '📑', app: 'SVD', callback: () => openSvdWindow() },
         { emoji: '❓', app: '说明', callback: (dock, index) => toggleHelp(dock.dock.querySelectorAll('.dock-item')[index]) },
         { emoji: '🖥️', app: '面板', callback: () => { if (window.openPanelMenu) window.openPanelMenu(); } },
-        { emoji: '📡', app: '通讯', callback: () => openCommWindow() }
+        { emoji: '📡', app: '通讯', callback: () => openCommWindow() },
+        { emoji: '🐞', app: '调试', callback: () => openIdeWindow() }
     ];
 
     const dockHost = document.getElementById('dockHost');

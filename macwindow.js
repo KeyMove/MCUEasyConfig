@@ -15,6 +15,20 @@
                         overflow: hidden;
                         display: flex;
                         flex-direction: column;
+                        /* 淡入淡出（参考 RichMenu） */
+                        opacity: 0;
+                        visibility: hidden;
+                        pointer-events: none;
+                        transform: scale(0.96);
+                        transition: opacity 0.22s ease, transform 0.26s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                    }
+
+                    /* 显示态：淡入 */
+                    .mac-window.mw-show {
+                        opacity: 1;
+                        visibility: visible;
+                        pointer-events: auto;
+                        transform: none;
                     }
                     
                     .mac-window .title-bar {
@@ -140,6 +154,7 @@
                     resizable: true,
                     canMuiltSelect: false,
                     canTopMost: true,
+                    show: true,               // 构造后是否立即显示（带淡入）；面板工作台设为 false 以延迟显示
                     ...options
                 };
 
@@ -154,6 +169,9 @@
 
                 // 创建窗口元素
                 this.createWindow();
+                // 默认显示（带淡入效果），与原 display:flex 默认可见行为一致；
+                // 传入 show:false 的窗口（如面板工作台的 4 窗口）延迟到显式 show() 才显示
+                if (this.options.show !== false) this.show();
                 
                 if(this.options.canMuiltSelect){
                     this.initSelection();
@@ -553,11 +571,38 @@
             }
 
             show() {
-                this.windowElement.style.display = 'flex';
+                // 先确保可见布局，下一帧再置可见并加 mw-show 触发淡入过渡
+                const el = this.windowElement;
+                el.style.display = 'flex';
+                el.style.visibility = 'visible';
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        if (!el.classList.contains('mw-show')) el.classList.add('mw-show');
+                    });
+                });
             }
 
             hide() {
-                this.windowElement.style.display = 'none';
+                // 移除 mw-show 触发淡出过渡；visibility 由 JS 在淡出结束后才切 hidden，
+                // 否则 CSS 里 visibility 会瞬间跳变导致看不到淡出过程
+                const el = this.windowElement;
+                el.classList.remove('mw-show');
+                const onEnd = (e) => {
+                    if (e.propertyName !== 'opacity') return;
+                    el.removeEventListener('transitionend', onEnd);
+                    if (!el.classList.contains('mw-show')) {
+                        el.style.visibility = 'hidden';
+                        el.style.display = 'none';
+                    }
+                };
+                el.addEventListener('transitionend', onEnd);
+                // 兜底：若过渡未触发（如已不可见），直接隐藏
+                setTimeout(() => {
+                    if (!el.classList.contains('mw-show')) {
+                        el.style.visibility = 'hidden';
+                        el.style.display = 'none';
+                    }
+                }, 320);
             }
 
             destroy() {

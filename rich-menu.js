@@ -965,7 +965,7 @@ class RichMenu {
         label.textContent = ctrl.label || ctrl.id;
         label.htmlFor = ctrl.id;
 
-        wrap.appendChild(label);
+        if (!ctrl.hideLabel) wrap.appendChild(label);
         if (innerEl) wrap.appendChild(innerEl);
         return wrap;
     }
@@ -1562,7 +1562,13 @@ class RichMenu {
         text.textContent = btnConfig.label || '按钮';
         btn.appendChild(text);
 
-        btn.addEventListener('click', () => this._handleButtonClick(btnConfig.type));
+        btn.addEventListener('click', () => {
+            if (btnConfig.type === 'button' && typeof btnConfig.onClick === 'function') {
+                btnConfig.onClick(this.getValues());
+            } else {
+                this._handleButtonClick(btnConfig.type);
+            }
+        });
         return btn;
     }
 
@@ -1693,11 +1699,35 @@ class RichMenu {
 
     // ==================== 显示/隐藏 ====================
 
+    /**
+     * 计算当前文档里「置顶窗口」的最大 z-index。
+     * MacWindow 的 z-index 从 10000 起随点击递增（MacWindow._topZ），
+     * 为了让弹出菜单永远盖在窗口之上，浮层需要高于这个值。
+     * @returns {number} 建议的浮层 z-index（至少为 100001）
+     */
+    _topZIndex() {
+        let max = 100000;
+        // 优先取 MacWindow 记录的当前置顶值
+        try {
+            if (typeof MacWindow !== 'undefined' && MacWindow._topZ) {
+                max = Math.max(max, MacWindow._topZ);
+            }
+        } catch (e) { /* ignore */ }
+        // 兜底：扫描所有 .mac-window 的实际 z-index
+        document.querySelectorAll('.mac-window').forEach(el => {
+            const z = parseInt(el.style.zIndex || '', 10);
+            if (!isNaN(z) && z > max) max = z;
+        });
+        return max + 1;
+    }
+
     show(x, y) {
         const c = this.config;
 
         if (c.mode === 'context') {
             this._setPosition(x ?? 0, y ?? 0);
+            // 永远盖在置顶窗口之上，避免弹窗被 MacWindow 遮挡
+            this.element.style.zIndex = this._topZIndex();
             // Delay to allow animation
             requestAnimationFrame(() => {
                 this.element.classList.add('rm-show');
@@ -1707,9 +1737,12 @@ class RichMenu {
                 this.element.classList.add('rm-show');
             });
         } else if (c.mode === 'dialog') {
+            const z = this._topZIndex();
             if (this.overlay) {
+                this.overlay.style.zIndex = z;
                 this.overlay.classList.add('rm-show');
             }
+            this.element.style.zIndex = z + 1;
             requestAnimationFrame(() => {
                 this.element.classList.add('rm-show');
             });

@@ -19,6 +19,9 @@ class RichObjectEditor {
         this.rootLabel = options.rootLabel || null;
         this.highlightOnClick = !!options.highlightOnClick;
         this.hideAddRoot = !!options.hideAddRoot;
+        // 「关联单元格 (cell)」选项：仅在与表格联动的「opt 主动打开」场景下有意义，
+        // 新建自定义设备等场景传 true 隐藏，避免产生歧义。
+        this.hideCell = !!options.hideCell;
         this.editableKey = options.editableKey !== false; // 默认可双击改名
         // 「推送到布局窗口」：开启后每个叶子节点右侧出现 ➡ 按钮，
         // 点击时把该节点的控件定义（path + schema + 当前值）推给回调。
@@ -1046,6 +1049,7 @@ class RichObjectEditor {
             { type: 'email', icon: '📧', name: '邮箱' },
             { type: 'label', icon: '🏷️', name: '标签' },
             { type: 'button', icon: '🔘', name: '按钮' },
+            { type: 'define', icon: '📐', name: 'define 投射' },
         ];
 
         // 显示路径和原始key信息
@@ -1161,11 +1165,13 @@ class RichObjectEditor {
         // 通用字段
         html += `<div class="roe-schema-row"><label>标签 (label)</label><input type="text" id="roe-cfg-label" value="${s.label || ''}"></div>`;
         html += `<div class="roe-schema-row"><label>占位提示 (placeholder)</label><input type="text" id="roe-cfg-placeholder" value="${s.placeholder || ''}"></div>`;
-        // 关联 Excel 单元格 —— 控件与表格公式联动的关键
+        // 关联 Excel 单元格 —— 控件与表格公式联动的关键（仅 opt 主动打开时显示）
+        if (!this.hideCell) {
         html += `<div class="roe-schema-row">
             <label>关联单元格 (cell) — 填写后该控件与表格单元格双向联动，可参与公式计算</label>
             <input type="text" id="roe-cfg-cell" value="${this._escapeHtml(s.cell || '')}" placeholder="如: A1 / B2 / C3">
         </div>`;
+        }
 
         if (type === 'number' || type === 'range') {
             html += `<div class="roe-schema-row"><label>最小值 (min)</label><input type="number" id="roe-cfg-min" value="${s.min !== undefined ? s.min : ''}"></div>`;
@@ -1213,6 +1219,18 @@ class RichObjectEditor {
                 作用：点击按钮只刷新<b style="color:#38bdf8">绑定的这一个表格</b>，并沿依赖链<b style="color:#38bdf8">链式刷新</b>关联单元格：<br>
                 · 填了「写入的值」→ 把该值赋给关联单元格，赋值会触发后续依赖单元格级联更新；<br>
                 · 没填值 → 不改动单元格，仅触发一次该单元格的依赖链刷新（重跑其下游公式里的 JS / 请求）。</div>`;
+        }
+
+        // define 投射控件：把「关联单元格的值」直接投射成 C 编译器的全局 #define。
+        // 宏名 = 标签(label，即节点名)；宏体 = 绑定单元格的值（支持 JS 公式算出）。
+        if (type === 'define') {
+            html += `<div class="roe-schema-row"><label>宏名 (macroName) — 即本控件的标签/节点名，编译时作为全局 #define 的名称</label>
+                <input type="text" id="roe-cfg-macroname" value="${this._escapeHtml(s.macroName || s.label || '')}" placeholder="如: SCALE / CLAMP(x)"></div>`;
+            html += `<div class="roe-schema-row"><label>宏体 (value) — 多行文本；若绑定单元格则取单元格值（单元格支持 JS 公式，可动态算出宏体）</label>
+                <textarea id="roe-cfg-define-body" rows="4" placeholder="如: 42&#10;或函数式宏体: (x>255?255:x)">${this._escapeHtml(s.defValue || '')}</textarea></div>`;
+            html += `<div style="font-size:11px; color:#64748b; line-height:1.6; margin-top:4px;">
+                作用：绑定单元格的值会在<b style="color:#38bdf8">编译 C 代码时</b>注入为全局 #define（宏名如上），<br>
+                源码里可直接使用而无需手写 #define。单元格支持 JS 表达式，可实现「面板值 → 宏」的灵活生成。</div>`;
         }
 
         html += '</div>';
@@ -1283,6 +1301,14 @@ class RichObjectEditor {
                 }
             });
             config.options = options;
+        }
+
+        // define 投射控件：收集宏名与默认宏体（运行态以绑定单元格的实时值为准）
+        if (type === 'define') {
+            const mn = this._$('roe-cfg-macroname');
+            if (mn && mn.value.trim()) config.macroName = mn.value.trim();
+            const body = this._$('roe-cfg-define-body');
+            if (body && body.value !== '') config.defValue = body.value;
         }
 
         return config;

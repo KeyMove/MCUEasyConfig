@@ -122,8 +122,8 @@ function StringLiteral(addr) {
   return { kind: 'StringLiteral', addr };
 }
 
-function Identifier(name, symIdx) {
-  return { kind: 'Identifier', name, symIdx };
+function Identifier(name, symIdx, line) {
+  return { kind: 'Identifier', name, symIdx, line };
 }
 
 function BinaryOp(left, opToken, right) {
@@ -138,8 +138,8 @@ function Assign(target, value, isCompound, compoundToken) {
   return { kind: 'Assign', target, value, isCompound: !!isCompound, compoundToken };
 }
 
-function FunctionCall(name, symIdx, args, calleeExpr) {
-  return { kind: 'FunctionCall', name, symIdx, args, calleeExpr: calleeExpr || null };
+function FunctionCall(name, symIdx, args, calleeExpr, line) {
+  return { kind: 'FunctionCall', name, symIdx, args, calleeExpr: calleeExpr || null, line };
 }
 
 function Dereference(ptr) {
@@ -674,14 +674,41 @@ class Preprocessor {
   }
 
   // include: { 'filename': 'source content', ... } 文件名 -> 内容 的大对象
-  constructor(include) {
+  // defines: 全局预设宏 { 'NAME': 'body', 'NAME(a,b)': 'body' }，类比 include，
+  //   由外部（如面板联动）在编译前注入，源码里的 #undef 仍可覆盖它们。
+  constructor(include, defines) {
     this.macros = new Map();   // name -> macro
     this.include = Object.assign({}, include || {}); // filename -> source text
+    this.defines = {};         // name-or-signature -> body text
+    if (defines) this.setDefines(defines);
   }
 
   // 后续设置/追加 include
   setInclude(obj) { this.include = Object.assign({}, obj || {}); return this; }
   addInclude(name, content) { this.include[name] = content; return this; }
+
+  // 设置全局预设宏（整体替换）。key 为宏名或带参签名（如 'MAX(a,b)'），value 为宏体文本。
+  setDefines(obj) { this.defines = Object.assign({}, obj || {}); return this; }
+  // 追加/覆盖单条全局宏
+  addDefine(key, body) { this.defines[key] = body; return this; }
+  // 删除一条全局宏
+  removeDefine(key) { delete this.defines[key]; return this; }
+
+  // 把全局 defines 预注册进宏表（在 preprocessing 开头调用）。
+  // 每条按 "#define <key> <body>" 形式解析，因此支持对象式与函数式宏。
+  _applyGlobalDefines() {
+    for (const key in this.defines) {
+      if (!Object.prototype.hasOwnProperty.call(this.defines, key)) continue;
+      const toks = Preprocessor.tokenize('#define ' + key + ' ' + this.defines[key]);
+      // tokenize 返回的 token 流以 NEWLINE/EOF 收尾；parseDefine 吃 #define 之后的内容。
+      // 找到 'define' 关键字后的切片交给 parseDefine。
+      let i = 0;
+      while (toks[i] && !(toks[i].t === Preprocessor.T.ID && toks[i].v === 'define')) i++;
+      if (toks[i]) i++; // 跳过 'define'
+      const rest = toks.slice(i).filter(t => t.t !== Preprocessor.T.NEWLINE && t.t !== Preprocessor.T.EOF);
+      this.parseDefine(rest);
+    }
+  }
 
   // 解析一条 #define 指令 (toks 为 #define 之后的 token 流, 不含 # 与 define 关键字)
   parseDefine(data) {
@@ -915,7 +942,15 @@ class Preprocessor {
     function eq() { let v = rel(); while (data[i] && data[i].t === Preprocessor.T.PUNCT && (data[i].v === '==' || data[i].v === '!=')) { const op = data[i].v; i++; const r = rel(); v = (op === '==' ? v === r : v !== r) ? 1 : 0; } return v; }
     function land() { let v = eq(); while (data[i] && data[i].t === Preprocessor.T.PUNCT && data[i].v === '&&') { i++; const r = eq(); v = (v && r) ? 1 : 0; } return v; }
     function lor() { let v = land(); while (data[i] && data[i].t === Preprocessor.T.PUNCT && data[i].v === '||') { i++; const r = land(); v = (v || r) ? 1 : 0; } return v; }
-    return lor() ? 1 : 0;
+    const val = lor() ? 1 : 0;
+    // 完整性校验：若 #if 表达式还有未消费的 token（残缺/多余），说明语法错误，需明确报错
+    // 而非静默当作 false（否则 #if 包裹的 main 被跳过会导致 "No TAC code" 且无提示）
+    while (data[i] && (data[i].t === Preprocessor.T.WS || data[i].t === Preprocessor.T.COMMENT)) i++;
+    if (data[i] && data[i].t !== Preprocessor.T.EOF) {
+      const rest = Preprocessor.tokensToText(data.slice(i)).trim();
+      throw new Error(`[预处理器] #if 表达式无法解析到结尾，多余/残缺内容: "${rest}"`);
+    }
+    return val;
   }
 
   // ---- 数组维度 / 初始化器 常量表达式折叠 (M4) ----
@@ -1071,7 +1106,11 @@ class Preprocessor {
   // 入参 src 为待预处理源码; 返回拍平后的 C 源码文本.
   // #include "xxx" / <xxx> 优先从构造时传入的 include 对象 (文件名->内容) 中取;
   // 找不到则忽略该包含.
-  preprocessing(src) {
+  preprocessing(src, includingStack) {
+    // includingStack: 内部递归用，记录已展开的文件（含初始文件），用于检测循环包含
+    const stack = includingStack || new Set();
+    // 先应用全局预设宏（外部注入）；源码里的 #undef / 重定义将在后续行覆盖它们。
+    if (this.defines && Object.keys(this.defines).length) this._applyGlobalDefines();
     const toksAll = Preprocessor.tokenize(src);
     const lines = [];
     let cur = [];
@@ -1137,9 +1176,23 @@ class Preprocessor {
             fname = Preprocessor.detokenize(args.slice(1, j)).trim();
           }
           if (fname && Object.prototype.hasOwnProperty.call(this.include, fname)) {
+            if (stack.has(fname)) {
+              throw new Error(`[预处理器] 检测到循环 #include: "${fname}" 已在展开栈中`);
+            }
             const inc = this.include[fname];
-            const subToks = Preprocessor.tokenize(this.preprocessing(inc));
-            for (const tk of subToks) out.push(tk);
+            stack.add(fname);
+            const subToks = Preprocessor.tokenize(this.preprocessing(inc, stack));
+            stack.delete(fname);
+            // 注意：递归预处理返回的 token 流以 EOF 结尾，EOF 不可进入 out，
+            // 否则会在 detokenize 时提前截断、吞掉后续所有代码（空文件尤为明显）。
+            for (const tk of subToks) { if (tk.t === Preprocessor.T.EOF) continue; out.push(tk); }
+          } else if (fname) {
+            // 引号形式（用户自有文件）找不到时明确报错，否则整份代码（含 main）可能被跳过，
+            // 仅得到误导性的 "No TAC code"。尖括号形式（系统头）按原设计静默忽略。
+            const isSys = args[0] && args[0].t === Preprocessor.T.PUNCT && args[0].v === '<';
+            if (!isSys) {
+              throw new Error(`[预处理器] 找不到要包含的文件 "${fname}"（请确认 IDE 中存在同名文件）`);
+            }
           }
           break;
         }
@@ -4024,6 +4077,8 @@ class kc_reg {
     this._storeTargetType=type.INT; // 最近一次 genExpr 的目标存储类型
     this._isLeaf=false; // 当前函数是否为叶函数 (ReturnStmt 的 LEAVE 需要此信息)
     this._lastSlotOff=-1; // 最近一次 Identifier 的 slot 偏移 (复合赋值用 STORE_OFF)
+    this.fileIncludes = {}; // 多文件 #include: { 'filename': 'content' }，由调用方在 Comper 前填充
+    this.globalDefines = {}; // 全局预设宏: { 'NAME': 'body', 'NAME(a,b)': 'body' }，由调用方（如面板联动）在 Comper 前填充
     for(let i=0;i<1024;i++) this.sysboltable.push({Token:0,Hash:0,Name:0,Class:0,Type:0,Val:0,HClass:0,HType:0,HVal:0,Arr:0,Const:0,Weak:0,FuncId:-1,ArrSize:0,InReg:0});
   }
 
@@ -4155,7 +4210,13 @@ class kc_reg {
     // 未定义的中断向量槽由 genROM 步骤 1 用 `B .` 无限循环兜底, 不会跑飞.
     // 预处理器 (M1): 独立 parse, 把 #define/#undef 拍平为纯 C 文本后再进编译器, 完全解耦.
     
-    const srcCodeFlat = new Preprocessor().preprocessing(srcCode);
+    const srcCodeFlat = new Preprocessor(this.fileIncludes, this.globalDefines).preprocessing(srcCode);
+    // 预处理拍平后整份源码为空（仅空白/注释）：可能是主文件本身为空、
+    // 所有代码被 #if/#ifndef 跳过，或 #include 的文件内容为空。
+    // 在此给出明确提示，避免在后端才暴露晦涩的 "No TAC code"。
+    if (!srcCodeFlat || !srcCodeFlat.trim()) {
+      throw new Error('[预处理器] 预处理后程序为空：没有任何可编译的代码（可能主文件为空、所有代码被条件编译跳过，或 #include 的文件内容为空）');
+    }
     const codeBytes = te.encode(srcCodeFlat);
     const srcLen = kwBytes.length + codeBytes.length + 1;
     const combined = new Uint8Array(srcLen + 1);
@@ -4568,7 +4629,11 @@ class kc_reg {
     }
     return result;
   }
+  // 从 data 区读以 0 结尾的字符串（符号名/字面量等存入 data 的字符串）。
+  // 注意：sysboltable[].Name 存的是“源码偏移”，不是 data 偏移——
+  //   取标识符名字必须用 _getSrcId(Name)，用 getstring(Name) 会读错位置得到空串。
   getstring(dpos){let s='';while(this.data[dpos]!==0)s+=String.fromCharCode(this.data[dpos++]);return s;}
+  // 从源码串 this.src 按偏移提取一个标识符（[A-Za-z0-9_]），用于读取 sysboltable[].Name 等源码偏移字段。
   _getSrcId(off){let s='';while(this.src[off]&&((this.src[off]>=97&&this.src[off]<=122)||(this.src[off]>=65&&this.src[off]<=90)||(this.src[off]>=48&&this.src[off]<=57)||this.src[off]===95))s+=String.fromCharCode(this.src[off++]);return s;}
 
   // 从符号表构建初始化记录 (供 genROM 使用)
@@ -4879,15 +4944,15 @@ class kc_reg {
           this.tokentype=fnSym.Type;
           // 函数指针: 保存 callee 表达式
           if(fnSym.Class===tokens.Loc||fnSym.Class===tokens.Glo){
-            node=AST.FunctionCall(this.getstring(fnSym.Name),lastsymbol,args,node);
+            node=AST.FunctionCall(this.getstring(fnSym.Name),lastsymbol,args,node,this.line);
           }else{
-            node=AST.FunctionCall(this.getstring(fnSym.Name),lastsymbol,args);
+            node=AST.FunctionCall(this.getstring(fnSym.Name),lastsymbol,args,undefined,this.line);
           }
         }else if(this.sysboltable[lastsymbol].Class===tokens.Num){
           this.tokentype=type.INT;node=AST.IntLiteral(this.sysboltable[lastsymbol].Val);
         }else{
           this.tokentype=this.sysboltable[lastsymbol].Type;
-          node=AST.Identifier(this.getstring(this.sysboltable[lastsymbol].Name),lastsymbol);
+          node=AST.Identifier(this.getstring(this.sysboltable[lastsymbol].Name),lastsymbol,this.line);
         }
       }
       // 括号/转换
@@ -5272,6 +5337,10 @@ class kc_reg {
             }
           }
         } else {
+          if(sym.Class===0){
+            const ln = node.line || this.stmtLine || this.line;
+            throw new Error(`${ln}: undeclared identifier '${this._getSrcId(sym.Name)}'`);
+          }
           this.emit(opcode.LDA, this.acc, sym.Val);
           this.emit(opcode.MOV, this.tmp2, this.acc);
           if(!sym.Arr){
@@ -5511,7 +5580,7 @@ class kc_reg {
         if(node.calleeExpr && node.calleeExpr.kind === 'Dereference'){
           this.genExpr(node.calleeExpr.ptr);
         } else {
-          this.genExpr(node.calleeExpr || {kind:'Identifier',symIdx:node.symIdx});
+          this.genExpr(node.calleeExpr || {kind:'Identifier',symIdx:node.symIdx,line:node.line});
         }
         this.emit(opcode.MOV, 7, this.acc); // 函数地址 → R7
         Object.assign(this, saved);
@@ -6512,10 +6581,10 @@ kc_reg.defaultSysFuncs={
 
 // UMD 导出：Node 用 module.exports，浏览器挂到 window.C4Reg
 if (_c4RegIsNode) {
-  module.exports = { kc_reg, RegBackend, opcode, tokens };
+  module.exports = { kc_reg, RegBackend, opcode, tokens, Preprocessor };
 } else if (typeof window !== 'undefined') {
-  window.C4Reg = { kc_reg, RegBackend, opcode, tokens };
+  window.C4Reg = { kc_reg, RegBackend, opcode, tokens, Preprocessor };
 } else if (typeof define === 'function' && define.amd) {
-  define(() => ({ kc_reg, RegBackend, opcode, tokens }));
+  define(() => ({ kc_reg, RegBackend, opcode, tokens, Preprocessor }));
 }
 })();

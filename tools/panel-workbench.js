@@ -85,6 +85,11 @@ class PanelWorkbench {
     padding: 3px 7px; font-size: 11px; cursor: pointer; }
 .pw-panel-menu .ppm-mini:hover { background: #475569; }
 .pw-panel-menu .ppm-del:hover { background: #b91c1c; }
+.pw-panel-menu .ppm-run { background: #15803d; color: #fff; }
+.pw-panel-menu .ppm-run:hover { background: #16a34a; }
+.pw-panel-menu .ppm-run-cur { width: 100%; background: linear-gradient(180deg,#0ea5e9,#0284c7); color: #fff;
+    border: none; border-radius: 7px; padding: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.pw-panel-menu .ppm-run-cur:hover { filter: brightness(1.1); }
 .pw-panel-menu .ppm-hint { color: #64748b; font-size: 11px; margin-top: 10px; line-height: 1.5; }
 .pw-panel-menu .ppm-toast { margin-top: 8px; padding: 6px 8px; background: #064e3b; color: #6ee7b7;
     border-radius: 5px; font-size: 12px; opacity: 0; transition: opacity .2s; }
@@ -109,8 +114,11 @@ class PanelWorkbench {
                 <input type="text" class="ppm-name" placeholder="面板名称，如：温控面板">
                 <button class="ppm-btn ppm-save">保存当前</button>
             </div>
+            <div class="ppm-row">
+                <button class="ppm-btn ppm-run-cur" title="把当前工作台编译为独立运行实例（不依赖编辑窗口）">▶ 运行当前设计</button>
+            </div>
             <div class="ppm-list"></div>
-            <div class="ppm-hint">点面板名＝直接打开成品 · 点 ✎ ＝打开并编辑</div>
+            <div class="ppm-hint">点面板名＝直接打开成品 · 点 ▶ ＝编译为独立实例(可多开) · 点 ✎ ＝打开并编辑</div>
         `;
         document.body.appendChild(menu);
         this._panelMenu = menu;
@@ -134,6 +142,7 @@ class PanelWorkbench {
                 <div class="ppm-item" data-name="${this._escAttr(n)}">
                     <span class="ppm-item-name" title="点击直接打开成品面板">${this._escHtml(n)}</span>
                     <span class="ppm-item-actions">
+                        <button class="ppm-mini ppm-run" title="编译为独立运行实例（可多开）">▶</button>
                         <button class="ppm-mini ppm-edit" title="打开并编辑">✎</button>
                         <button class="ppm-mini ppm-del" title="删除">🗑</button>
                     </span>
@@ -158,6 +167,19 @@ class PanelWorkbench {
             renderList();
         });
 
+        // 运行当前设计：把当前工作台整套（数据+布局+单元格）编译成独立运行实例。
+        // 这样即使关掉编辑窗口，运行实例依然独立存在、可被其它实例/通讯模块通知驱动。
+        menu.querySelector('.ppm-run-cur').addEventListener('click', () => {
+            const name = (menu.querySelector('.ppm-name').value || '').trim()
+                || ('未命名面板-' + (PanelRuntime.listRunning().length + 1));
+            const proj = this.exportProject();
+            proj._name = name;
+            const rt = PanelRuntime.run(proj, { name });
+            this._ppmToast(menu, `已运行「${name}」为独立实例（可多开）`);
+            this._panelMenu && this._panelMenu.remove();
+            this._panelMenu = null;
+        });
+
         // 列表内事件（打开成品 / 编辑 / 删除）
         listEl.addEventListener('click', (e) => {
             const item = e.target.closest('.ppm-item');
@@ -167,6 +189,14 @@ class PanelWorkbench {
                 const r = this.deletePanel(name);
                 this._ppmToast(menu, r.msg);
                 renderList();
+            } else if (e.target.classList.contains('ppm-run')) {
+                // 编译为独立运行实例：从 localStorage 加载快照，构造一套隔离的
+                // ExcelTable + PreviewWindow，与编辑工作台及其它实例互不干扰。
+                const rt = PanelRuntime.openCompiledPanel(name);
+                if (rt) this._ppmToast(menu, `已运行「${name}」（独立实例，可多开）`);
+                else this._ppmToast(menu, `运行失败：面板「${name}」不存在`);
+                this._panelMenu && this._panelMenu.remove();
+                this._panelMenu = null;
             } else if (e.target.classList.contains('ppm-edit')) {
                 // 打开现有面板并编辑：加载数据 + 显示全部 4 窗口（重排回四宫格）
                 this._createWindowsIfNeeded();
@@ -260,26 +290,29 @@ class PanelWorkbench {
             width: w, height: h, x, y,
             content: '<div class="wb-excel-host"></div>',
             resizable: true, dark: true,
+            show: false,   // 延迟显示：仅当用户「创建新面板 / 选择面板」时才 show
         });
         const host = this.excelWin.contentElement.querySelector('.wb-excel-host');
         this.excelWin.contentElement.style.padding = '0';
         // 滚动交给 ExcelTable 内部的 .excel-table-container，外层 host 不重复出现滚动条
         host.style.cssText = 'width:100%;height:100%;overflow:hidden;';
         this.excel = new ExcelTable(host, this.opts.rows || 16, this.opts.cols || 12, { dark: true });
+        // 单元格右键 → 用已加载的 AXF 符号名直接填变量地址 / 读写公式
+        if (typeof attachSwdVarMenu === 'function') attachSwdVarMenu(this.excel);
     }
 
     // ==================== ④ 成品窗口 ====================
     _createPreviewWindow(x, y, w, h) {
         this.preview = new PreviewWindow({
             excel: this.excel,
-            windowOpts: { x, y, width: w, height: h },
+            windowOpts: { x, y, width: w, height: h, show: false },
         });
     }
 
     // ==================== ③ 布局窗口 ====================
     _createLayoutWindow(x, y, w, h) {
         this.layout = new LayoutWindow({
-            windowOpts: { x, y, width: w, height: h },
+            windowOpts: { x, y, width: w, height: h, show: false },
             // 布局一变，成品窗口立刻重绘 —— 实时看到成品长什么样
             // 布局一变（含每个控件的独立显示选项）都会实时重绘成品窗口
             onLayoutChange: (defs) => {
@@ -306,6 +339,7 @@ class PanelWorkbench {
             width: w, height: h, x, y,
             content: '<div class="wb-editor-host" style="height:100%;"></div>',
             resizable: true, dark: true,
+            show: false,   // 延迟显示：仅当用户「创建新面板 / 选择面板」时才 show
         });
         this.editorWin.contentElement.style.padding = '0';
         const host = this.editorWin.contentElement.querySelector('.wb-editor-host');

@@ -21,6 +21,9 @@ class PreviewWindow {
         this.defs = [];
         this.instances = new Map(); // id -> { def, el, unbind, getVal, setVal }
         this.onValueChange = opts.onValueChange || null;
+        // 命名空间：每个成品窗口独立随机后缀，避免 radio 的 name 在多实例间撞车
+        // （HTML 按 name 分组的 radio 跨窗口共享同 name 会互相取消选择）。
+        this.ns = 'pwv' + Math.random().toString(36).slice(2, 9);
         // 显示选项（由布局窗口的勾选框控制，成品窗口只负责呈现）
         this.displayOptions = Object.assign(
             { name: true, border: true, value: true }, opts.displayOptions || {});
@@ -236,6 +239,32 @@ class PreviewWindow {
             return box;
         }
 
+        // define 投射控件：只读多行文本，展示「关联单元格的值」（即宏体）。
+        // 不接收用户输入，仅呈现并把该值交给编译流程投射为全局 #define。
+        // 单元格变化（来自其它控件的 JS 公式）时实时刷新文本。
+        if (type === 'define') {
+            box.classList.remove('unbound');
+            box.classList.add('pw-type-textarea'); // 复用多行撑满样式
+            const ta = document.createElement('textarea');
+            ta.readOnly = true;
+            ta.placeholder = '（绑定单元格为空）';
+            ta.value = this._initVal(def, def.defValue || '');
+            box.appendChild(ta);
+            const getVal = () => ta.value;
+            const setVal = (v) => { ta.value = (v === undefined || v === '') ? '' : String(v); };
+            let unbind = () => {};
+            if (this.excel && def.cell && this.excel.hasCell(def.cell)) {
+                const cur = this.excel.getCell(def.cell);
+                if (cur !== undefined && cur !== '') ta.value = cur;
+                unbind = this.excel.bindCell(def.cell, { get: getVal, set: setVal }, ta);
+            } else if (def.defValue !== undefined && def.defValue !== '') {
+                ta.value = def.defValue;
+            }
+            this.stage.appendChild(box);
+            this.instances.set(def.id, { def, el: box, unbind, getVal, setVal });
+            return box;
+        }
+
         const head = document.createElement('div');
         head.className = 'pw-head';
         head.innerHTML = `<span class="pw-lb">${this._esc(def.label || def.id)}</span>
@@ -315,7 +344,7 @@ class PreviewWindow {
             case 'radio': {
                 const wrap = document.createElement('div');
                 wrap.className = 'pw-radio';
-                const name = 'pw_' + def.id;
+                const name = this.ns + '_' + def.id;
                 const iv = this._initVal(def, '');
                 (def.options || []).forEach(o => {
                     const lb = document.createElement('label');

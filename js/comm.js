@@ -34,10 +34,10 @@ function openCommWindow() {
         parent: document.body,
         title: '通讯',
         dark: true,
-        // 接近全屏：宽度取视口 92%，高度取视口 90%（预留 Dock 与边缘空间）
-        width: Math.round(window.innerWidth * 0.92),
+        // 宽度减半、高度保持视口 90%：宽度取视口 46%，居中显示
+        width: Math.round(window.innerWidth * 0.46),
         height: Math.round(window.innerHeight * 0.90),
-        x: Math.round(window.innerWidth * 0.04),
+        x: Math.round((window.innerWidth - window.innerWidth * 0.46) / 2),
         y: Math.round(window.innerHeight * 0.05),
         resizable: true,
         canTopMost: true
@@ -60,6 +60,15 @@ function openCommWindow() {
 }
 .rm-row > .rm-control:has(.rm-control-btn) .rm-control-btn {
     width: auto;
+}
+/* 数据预览（十六进制）：等宽字体、缩小字号，看起来更规则 */
+#swd_hex.rm-textarea {
+    font-family: 'SF Mono', 'Menlo', 'Consolas', 'Liberation Mono', monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    letter-spacing: 0.3px;
+    white-space: pre;
+    tab-size: 4;
 }`;
         document.head.appendChild(st);
     }
@@ -191,7 +200,7 @@ function swdTabSection() {
                 accept: '.bin,.hex,.axf,.flm,.spi', span: 'full' },
             // 十六进制显示（类 WinHex）
             { type: 'heading', label: '数据预览（十六进制）', span: 'full' },
-            { type: 'textarea', id: 'swd_hex', label: '', readonly: true, span: 'full',
+            { type: 'textarea', id: 'swd_hex', label: '', hideLabel: true, readonly: true, span: 'full',
                 rows: 12, placeholder: '选择 bin 文件后在此显示十六进制内容',
                 value: '' },
             // 下载按钮 + 在 RAM 中运行按钮（并排，下载占满、运行按钮宽度自适应文字）
@@ -426,6 +435,9 @@ function isMobileDevice() {
 function swdSetOpenState(open, opts = {}) {
     __swdOpen = open;
     if (!open) __swdConnect = false;
+    // 同步到 window，供 swd.js 的 mcuR32/mcuW32 等跨文件读取真实连接状态
+    window.__swdOpen = __swdOpen;
+    window.__swdConnect = __swdConnect;
     const btn = window.__commMenu && window.__commMenu.menuControls['swd_open'];
     if (btn) btn.innerText = open ? '关闭 SWD 设备' : '打开 SWD 设备';
     if (!open && opts.reason) Toast.warning('已断开', opts.reason);
@@ -472,13 +484,22 @@ function swdOpenDevice() {
         };
         dev.open();
     } else if ((type === 'COM' || type === 'BLE') && typeof UARTSWDDevice !== 'undefined') {
-        // 复用同一个 transport 实例：第一次创建，之后直接 transport.open() 即可，
-        // COMHelper.open() 内部 if(this.isOpen) 分支会自行先关闭再重开，无需每次 new。
-        if (!__uartTransport) {
-            __uartTransport = (type === 'BLE')
+        // 复用 transport 实例，但当下拉类型与已创建 transport 的类型不一致时必须重建，
+        // 否则切到 BLE 仍会打开之前创建的 COM（或反之）——这正是“切设备下拉无效”的根因。
+        const wantBle = (type === 'BLE');
+        const isBle = __uartTransport && typeof BLEUART !== 'undefined' && __uartTransport instanceof BLEUART;
+        const isCom = __uartTransport && typeof COMHelper !== 'undefined' && __uartTransport instanceof COMHelper;
+        if (!__uartTransport || (wantBle !== isBle)) {
+            // 旧 transport 存在且不是目标类型 -> 先关闭释放端口/配对，再重建
+            if (__uartTransport && __uartTransport.close) {
+                try { __uartTransport.close(); } catch (e) {}
+            }
+            __uartTransport = wantBle
                 ? (typeof BLEUART !== 'undefined' ? new BLEUART(onTransStatus) : null)
                 : (typeof COMHelper !== 'undefined' ? new COMHelper(onTransStatus, () => {}) : null);
             if (__uartTransport) __uartSWD = new UARTSWDDevice(__uartTransport);
+        } else if (!__uartSWD) {
+            __uartSWD = new UARTSWDDevice(__uartTransport);
         }
         if (!__uartTransport) { Toast.error('不支持的接口', '当前浏览器需 Web Serial / Web Bluetooth'); return; }
 
