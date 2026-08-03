@@ -1,4 +1,4 @@
-# MCUEasyConfig（四向 Pad 节点连线系统 · MCU 引脚 / 寄存器可视化配置工具）
+# [MCUEasyConfig（四向 Pad 节点连线系统 · MCU 引脚 / 寄存器可视化配置工具）](https://keymove.github.io/MCUEasyConfig/)
 
 > 项目代号 **MCUEasyConfig**：一个纯前端的 MCU 引脚连线与寄存器配置可视化工具。在画布上拖出 MCU、自定义器件、外设，
 > 通过「四向 Pad」连线表达引脚连接关系，系统会**自动完成 AF 复用、GPIO 模式、上下拉、接口初始化代码生成**，
