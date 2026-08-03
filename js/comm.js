@@ -44,6 +44,9 @@ function openCommWindow() {
     });
     win.contentElement.style.padding = '0';
     win.contentElement.style.overflow = 'hidden';
+    win.contentElement.style.display = 'flex';
+    win.contentElement.style.flexDirection = 'column';
+    win.contentElement.style.minHeight = '0';
 
     // 注入按钮宽度自适应样式（仅一次）
     if (!document.getElementById('swd-glow-style')) {
@@ -632,7 +635,7 @@ function buildUartPanel(panel) {
     // 仅给共享祖先设定高（不影响 SWD/CAN 的默认流式布局），并让 panels 成为定位上下文
     const panels = panel.parentElement;            // .rm-tabs-panels
     if (panels) {
-        panels.style.height = '100%';
+        panels.style.flex = '1 1 auto';            // 占满 tab 导航以下剩余高度
         panels.style.minHeight = '0';
         panels.style.position = 'relative';        // uart-panel 绝对定位的参照
     }
@@ -640,7 +643,21 @@ function buildUartPanel(panel) {
     if (menuEl) {
         menuEl.style.height = '100%';
         menuEl.style.minHeight = '0';
+        menuEl.style.display = 'flex';             // 根节点改为 flex 列，让 .rm-body 能正确 flex
+        menuEl.style.flexDirection = 'column';
     }
+    // .rm-body 必须在根 flex 列中占满剩余高度（min-height:0 防止被内容撑高）
+    const bodyEl = menuEl && menuEl.querySelector('.rm-body');
+    if (bodyEl) {
+        bodyEl.style.flex = '1 1 auto';
+        bodyEl.style.minHeight = '0';
+        bodyEl.style.display = 'flex';
+        bodyEl.style.flexDirection = 'column';
+        bodyEl.style.overflow = 'hidden';          // 高度交给内部 grid，禁止自身滚动撑破布局
+    }
+    // tab 导航固定高度，不随内容伸缩
+    const navEl = menuEl && menuEl.querySelector('.rm-tabs-nav');
+    if (navEl) navEl.style.flex = '0 0 auto';
 
     // 注入自绘样式（仅一次）
     if (!document.getElementById('uart-panel-style')) {
