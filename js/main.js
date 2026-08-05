@@ -18,6 +18,10 @@ document.addEventListener('DOMContentLoaded', function () {
     // 供 system.js 右键 MCU 节点打开「该 MCU 的寄存器」编辑器使用
     window.openSvdWindow = openSvdWindow;
 
+    // 右键 JSON 菜单触发的面板：按节点保持单例（同一节点右键只维护一个面板实例，
+    // 避免一直右键一直开）。key=nodeId, value=PanelRuntime。
+    const devicePanelMap = new Map();
+
     const container = document.getElementById('container');
     nodeSystem.init(container);
 
@@ -655,10 +659,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 { key: 'custom', title: '【自定义器件】', controls: [
                     { type: 'textarea', id: 'devdef', label: '器件定义（第一行=名称 [封装] [接口名1] …；封装位写 conv=左右直通转换器，生成器件用 SOP 展示；接口名以 @ 开头=强制软件模拟，忽略 & 条件，可用于普通器件；后续每行=引脚 空格分隔 BUS IF）', rows: 8, span: 'full',
                       placeholder: '# 普通器件 + 强制软件模拟（@ 接口名可用于任意器件）：\nW25Q16 SOP @通用SPI_模拟\nCS GPIO_OUT\nMISO SPI MISO\nMOSI SPI MOSI\nCLK SPI SCK\nVDD\n\n# GPIO 输入变体（声明即置为输入模式，连 MCU 时两端自动带上/下拉）：\n#   GPIO_IN   输入（无上下拉）\n#   GPIO_INPU 输入 + 上拉\n#   GPIO_INPD 输入 + 下拉\n按键 KEY1 GPIO_INPU\n按键 KEY2 GPIO_INPD\n\n# 左右直通转换器（封装位 conv，左半=GPIO 接 MCU 普通 IO，右半=接口 接外设，pin 左右成对直通）：\nSPI模拟 conv @通用SPI_模拟\nSCK GPIO_OUT\nMOSI GPIO_OUT\nMISO GPIO_IN\nCS GPIO_OUT\nSCK SPI SCK\nMOSI SPI MOSI\nMISO SPI MISO\nCS SPI CS' },
-                    // 右键菜单 JSON：留空=不使用弹出式菜单；用于定义滑块/按钮等“器件部分操作”，
-                    // 方便直接调寄存器（如 PWM 占空比滑块 → TIMx.CCRn，最大值可引用 TIMx.ARR 动态变化）
-                    { type: 'textarea', id: 'devmenu', label: '右键菜单 JSON（留空=不使用弹出式菜单）', rows: 6, span: 'full',
-                      placeholder: '{\n  "ops": [\n    { "type":"slider", "label":"PWM 占空比", "register":"TIMx.CCRn", "min":0, "maxRegister":"TIMx.ARR", "width":16 }\n  ]\n}' },
+                    // 右键菜单 JSON：留空=不使用弹出式菜单。支持两种格式：
+                    //   1) ops 格式（配置简单菜单生成的 { "ops":[...] }）——滑块/按钮等直接写 SVD 寄存器；
+                    //   2) 面板导出 JSON（PanelWorkbench.exportProject() 风格快照）——右键直接弹出该面板。
+                    { type: 'textarea', id: 'devmenu', label: '右键菜单 JSON（留空=不使用弹出式菜单）', rows: 1, dense: true, span: 'full',
+                      placeholder: 'ops 格式：{"ops":[{"type":"slider","label":"PWM 占空比","register":"TIMx.CCRn","min":0,"max":"TIMx.ARR","width":16}]}；或面板导出的 JSON（含 layout/cells/data/schema）' },
+                    { type: 'button', id: 'cfgMenu', label: '配置简单菜单', style: 'secondary', onClick: () => openSimpleMenuEditor('devmenu') },
                     { type: 'button', id: 'genCustom', label: '生成自定义器件', onClick: () => {
                         const ta = dockMenu.menuControls['devdef'];
                         const def = parseDeviceDef(ta ? ta.value : '');
@@ -666,7 +672,10 @@ document.addEventListener('DOMContentLoaded', function () {
                         const mt = dockMenu.menuControls['devmenu'];
                         let menuRaw = (mt && mt.value && mt.value.trim()) ? mt.value.trim() : null;
                         if (menuRaw) {
-                            try { const p = JSON.parse(menuRaw); if (!Array.isArray(p) && !p.ops) throw new Error('缺少 ops 数组'); }
+                            // 合法格式：ops 数组（含裸数组），或面板导出 JSON（含 layout 且带 cells/data/schema/_meta 之一）
+                            const valid = (p) => (Array.isArray(p) || p.ops ||
+                                (p.layout && (p.cells || p.data || p.schema || p._meta)));
+                            try { const p = JSON.parse(menuRaw); if (typeof p !== 'object' || p === null || !valid(p)) throw new Error('非法格式（需 ops 数组或面板导出 JSON）'); }
                             catch (err) { alert('右键菜单 JSON 解析失败：' + err.message); return; }
                         }
                         def.deviceMenu = menuRaw;
@@ -695,10 +704,378 @@ document.addEventListener('DOMContentLoaded', function () {
         };
     }
 
+    // ============ 简单菜单可视化编辑器（生成「右键菜单 JSON」） ============
+    // 弹出一个 dialog 风格的 MacWindow，列表式编辑 ops（滑块/按钮），
+    // 顶部「应用定义」把 ops 打包成 {"ops":[...]} 写回目标文本域（如 devmenu）。
+    function openSimpleMenuEditor(targetId) {
+        targetId = targetId || 'devmenu';
+        // 读取目标文本框已有的 ops，作为初始数据
+        let initial = [];
+        try {
+            const ta = dockMenu && dockMenu.menuControls[targetId];
+            const raw = ta && ta.value && ta.value.trim();
+            if (raw) {
+                const p = JSON.parse(raw);
+                initial = Array.isArray(p) ? p : (p.ops || []);
+            }
+        } catch (e) { /* 解析失败则用空列表，不中断 */ }
+
+        const OP_TYPES = [
+            { value: 'slider', label: '滑块（写寄存器）' },
+            { value: 'button', label: '按钮（写寄存器）' },
+            { value: 'checkbox', label: '勾选框（写寄存器）' },
+            { value: 'text', label: '文本框（写寄存器）' },
+        ];
+        const BTN_STYLES = [
+            { value: 'secondary', label: '默认' },
+            { value: 'primary', label: '主色' },
+            { value: 'success', label: '绿' },
+            { value: 'danger', label: '红' },
+        ];
+
+        // ===== 仿 confirmModal：把模态挂在 dock 菜单内部（absolute;inset:0），菜单不会被外部点击关闭 =====
+        let overlay = document.getElementById('smmeOverlay');
+        if (overlay) overlay.remove();
+        overlay = document.createElement('div');
+        overlay.id = 'smmeOverlay';
+        const host = (dockMenu && dockMenu.element) ? dockMenu.element : document.body;
+        const insideMenu = host !== document.body;
+        let _topZ = 100000;
+        try { if (typeof MacWindow !== 'undefined' && MacWindow._topZ) _topZ = Math.max(_topZ, MacWindow._topZ); } catch (e) {}
+        document.querySelectorAll('.mac-window').forEach(el => {
+            const z = parseInt(el.style.zIndex || '', 10);
+            if (!isNaN(z) && z > _topZ) _topZ = z;
+        });
+        const _modalZ = _topZ + 1;
+        overlay.style.cssText = (insideMenu ? 'position:absolute;inset:0;' : 'position:fixed;inset:0;') +
+            'background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:' + _modalZ + ';' +
+            'font-family:system-ui,-apple-system,sans-serif;padding:16px;box-sizing:border-box;';
+        host.appendChild(overlay);
+
+        // 编辑器面板（深色卡片，纯内联样式，不依赖 RichMenu/MacWindow）
+        const box = document.createElement('div');
+        box.style.cssText = 'background:#1e293b;border:1px solid #475569;border-radius:11px;width:100%;max-width:420px;' +
+            'max-height:calc(100% - 16px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+        box.innerHTML = `
+            <div style="padding:14px 16px;border-bottom:1px solid #334155;color:#38bdf8;font-size:15px;font-weight:600;">配置简单菜单</div>
+            <div class="smme-body" style="padding:14px 16px;overflow-y:auto;color:#e2e8f0;font-size:13px;"></div>
+            <div style="padding:12px 16px;border-top:1px solid #334155;display:flex;gap:8px;align-items:center;">
+                <select class="smme-type-select" style="padding:7px 10px;background:#0f172a;border:1px solid #475569;color:#e2e8f0;border-radius:6px;font-size:13px;font-family:inherit;">
+                    <option value="slider">滑块</option>
+                    <option value="button">按钮</option>
+                    <option value="checkbox">勾选框</option>
+                    <option value="text">文本框</option>
+                </select>
+                <button class="smme-add" style="padding:7px 14px;border:1px solid #475569;background:transparent;color:#cbd5e1;border-radius:6px;cursor:pointer;font-size:13px;">添加</button>
+                <div style="flex:1;"></div>
+                <button class="smme-cancel" style="padding:7px 14px;border:1px solid #475569;background:transparent;color:#cbd5e1;border-radius:6px;cursor:pointer;font-size:13px;">取消</button>
+                <button class="smme-apply" style="padding:7px 14px;border:none;background:#38bdf8;color:#0f172a;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px;">应用</button>
+            </div>
+        `;
+        overlay.appendChild(box);
+
+        // 编辑器内容 DOM（样式随 DOM 注入）
+        const bodyEl = box.querySelector('.smme-body');
+        const root = document.createElement('div');
+        root.className = 'smme';
+        root.innerHTML = `
+            <style>
+            .smme { font-size:13px; color:#e2e8f0; }
+            .smme-op { background:#0f172a; border:1px solid #334155; border-radius:9px; margin-bottom:8px; }
+            .smme-op-head { display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer; }
+            .smme-op-head .smme-idx { color:#818cf8; font-weight:600; min-width:18px; }
+            .smme-op-head .smme-sum { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .smme-op-head .smme-sum b { color:#fff; }
+            .smme-op-head .smme-sum .smme-tag { color:#94a3b8; font-size:11px; margin-left:6px; }
+            .smme-op-body { display:none; padding:0 10px 10px; border-top:1px solid #334155; }
+            .smme-op.open .smme-op-body { display:block; }
+            .smme-grid { display:grid; grid-template-columns:auto 1fr; gap:6px 10px; align-items:center; margin-top:8px; }
+            .smme-grid label { text-align:right; color:#94a3b8; white-space:nowrap; font-size:12px; padding:3px 0; }
+            .smme-grid input, .smme-grid select { width:100%; padding:5px 8px; background:#1e293b; border:1px solid #334155; color:#e2e8f0; border-radius:6px; font-family:inherit; font-size:13px; box-sizing:border-box; }
+            .smme-grid .smme-field-hint { grid-column:2; color:#64748b; font-size:11px; margin-top:-2px; }
+            .smme-hint { color:#64748b; font-size:11px; margin-top:6px; line-height:1.4; }
+            .smme-reg-wrap { position:relative; width:100%; }
+            .smme-reg-drop { display:none; position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:99999;
+                background:#0f172a; border:1px solid #475569; border-radius:6px; max-height:180px; overflow-y:auto;
+                box-shadow:0 10px 30px rgba(0,0,0,0.5); }
+            .smme-reg-drop.show { display:block; }
+            .smme-reg-item { padding:5px 9px; font-size:12px; color:#e2e8f0; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+            .smme-reg-item:hover { background:#334155; color:#fff; }
+            </style>
+            <div class="smme-list"></div>
+            <div class="smme-hint">滑块/按钮均对应一个 SVD 寄存器（如 TIMx.CCRn、TIM1.ARR），改动实时写入寄存器。
+            滑块「最大」可填纯数字（如 255）或寄存器路径（如 TIM1.ARR），自动识别；通配 TIMx 需器件连接对应 TIM 才可解析。</div>
+        `;
+        bodyEl.appendChild(root);
+
+        const listEl = root.querySelector('.smme-list');
+        let seq = 1;
+
+        function makeOp(data) {
+            data = data || {};
+            const base = { label: '操作' + (seq++), register: '', width: 16 };
+            let def;
+            if (data.type === 'button') {
+                def = { type: 'button', value: '', style: 'secondary' };
+            } else if (data.type === 'checkbox') {
+                def = { type: 'checkbox', onValue: 1, offValue: 0 };
+            } else if (data.type === 'text') {
+                def = { type: 'text', placeholder: '' };
+            } else {
+                def = { type: 'slider', min: 0, max: '' };
+            }
+            return Object.assign(base, def, data);
+        }
+
+        function opSummary(op) {
+            const tagMap = { slider: '滑块', button: '按钮', checkbox: '勾选框', text: '文本框' };
+            const tag = tagMap[op.type] || op.type || '未知';
+            const reg = op.register ? ' · ' + op.register : '';
+            return `<b>${op.label || '(未命名)'}</b><span class="smme-tag">${tag}${reg}</span>`;
+        }
+
+        // 按控件类型返回需要显示的字段：[key, label, inputType]
+        function fieldsForType(type) {
+            const common = [['type', '类型'], ['label', '名称'], ['register', '寄存器']];
+            if (type === 'slider') {
+                return common.concat([
+                    ['width', '位宽', 'number'], ['min', '滑块最小', 'number'],
+                    ['max', '滑块最大'],
+                ]);
+            }
+            if (type === 'button') {
+                return common.concat([['value', '按钮写入值', 'number'], ['style', '按钮样式']]);
+            }
+            if (type === 'checkbox') {
+                return common.concat([
+                    ['width', '位宽', 'number'], ['onValue', '勾选写入值', 'number'], ['offValue', '取消写入值', 'number'],
+                ]);
+            }
+            if (type === 'text') {
+                return common.concat([['width', '位宽', 'number'], ['placeholder', '占位提示']]);
+            }
+            return common;
+        }
+
+        function field(op, key, labelText, type) {
+            const val = op[key] != null ? op[key] : '';
+            if (key === 'type') {
+                const opts = OP_TYPES.map(o => `<option value="${o.value}"${o.value === val ? ' selected' : ''}>${o.label}</option>`).join('');
+                return `<label>${labelText}</label><select data-k="type">${opts}</select>`;
+            }
+            if (key === 'style') {
+                const opts = BTN_STYLES.map(o => `<option value="${o.value}"${o.value === val ? ' selected' : ''}>${o.label}</option>`).join('');
+                return `<label>${labelText}</label><select data-k="style">${opts}</select>`;
+            }
+            // 寄存器 / 滑块最大：带快速检索下拉（参考 rich-obj-editor 检索栏，支持 TIM1.CR1.CEN）
+            // max 同时支持纯数字或寄存器路径，统一用检索框输入
+            if (key === 'register' || key === 'max') {
+                const ph = (key === 'max') ? '数字(如 255) 或寄存器(如 TIM1.ARR)' : '如 TIM1.CR1.CEN';
+                const hint = (key === 'max') ? `<div class="smme-field-hint">可填数字或寄存器路径，自动识别</div>` : '';
+                return `<label>${labelText}</label><div class="smme-reg-wrap">` +
+                    `<input data-k="${key}" data-regsearch="1" type="text" placeholder="${ph}" value="${String(val).replace(/"/g, '&quot;')}">` +
+                    `<div class="smme-reg-drop"></div></div>${hint}`;
+            }
+            const t = type || 'text';
+            return `<label>${labelText}</label><input data-k="${key}" type="${t}" value="${String(val).replace(/"/g, '&quot;')}">`;
+        }
+
+        // 构建 SVD 寄存器路径候选索引（外设.寄存器 / 外设.寄存器.位域），用于快速检索
+        function buildRegIndex() {
+            const idx = [];
+            const db = (typeof window.getActiveSvdDb === 'function') ? window.getActiveSvdDb() : null;
+            if (!db || !db.menu) return idx;
+            db.menu.forEach(p => {
+                if (!p || !p.label || !p.registers) return;
+                p.registers.forEach(r => {
+                    if (!r || !r.name) return;
+                    idx.push({ path: p.label + '.' + r.name, tail: r.name, peri: p.label });
+                    if (r.fields) r.fields.forEach(f => {
+                        if (!f || !f.name) return;
+                        idx.push({ path: p.label + '.' + r.name + '.' + f.name, tail: f.name, peri: p.label });
+                    });
+                });
+            });
+            return idx;
+        }
+        const regIndex = buildRegIndex();
+
+        // 寄存器检索框：输入时按末段/路径模糊匹配，渲染下拉建议
+        function setupRegSearch(input, dropEl, op) {
+            const doSearch = () => {
+                const q = input.value.trim().toLowerCase();
+                if (!q) { dropEl.classList.remove('show'); dropEl.innerHTML = ''; return; }
+                const segs = q.split('.');
+                const lastSeg = segs[segs.length - 1];
+                const hits = regIndex.filter(it => {
+                    if (!lastSeg) return it.path.toLowerCase().includes(q);
+                    // 末段匹配：路径末段包含查询末段，或完整路径包含查询
+                    return it.tail.toLowerCase().includes(lastSeg) || it.path.toLowerCase().includes(q);
+                }).slice(0, 12);
+                dropEl.innerHTML = '';
+                if (!hits.length) { dropEl.classList.remove('show'); return; }
+                hits.forEach(it => {
+                    const item = document.createElement('div');
+                    item.className = 'smme-reg-item';
+                    item.textContent = it.path;
+                    item.addEventListener('mousedown', (e) => { // mousedown 优先于 input blur
+                        e.preventDefault();
+                        input.value = it.path;
+                        const k = input.dataset.k;
+                        op[k] = it.path;
+                        dropEl.classList.remove('show');
+                        dropEl.innerHTML = '';
+                        const cardEl = input.closest('.smme-op');
+                        if (cardEl) cardEl.querySelector('.smme-sum').innerHTML = opSummary(op);
+                    });
+                    dropEl.appendChild(item);
+                });
+                dropEl.classList.add('show');
+            };
+            input.addEventListener('input', doSearch);
+            input.addEventListener('focus', doSearch);
+            input.addEventListener('blur', () => setTimeout(() => { dropEl.classList.remove('show'); }, 120));
+        }
+
+        function buildOpCard(op) {
+            const card = document.createElement('div');
+            card.className = 'smme-op';
+            const rows = fieldsForType(op.type).map(([k, lbl, t]) => field(op, k, lbl, t)).join('');
+            card.innerHTML = `
+                <div class="smme-op-head">
+                    <span class="smme-idx"></span>
+                    <span class="smme-sum">${opSummary(op)}</span>
+                </div>
+                <div class="smme-op-body">
+                    <div class="smme-grid">${rows}</div>
+                </div>
+            `;
+            // 交互：点击头部展开/折叠（排除删除按钮）
+            card.querySelector('.smme-op-head').addEventListener('click', (e) => {
+                if (e.target.closest('.smme-del')) return;
+                card.classList.toggle('open');
+            });
+            // 绑定输入 → 写回 op
+            card.querySelectorAll('[data-k]').forEach(inp => {
+                const k = inp.dataset.k;
+                const evt = (inp.tagName === 'SELECT') ? 'change' : 'input';
+                inp.addEventListener(evt, () => {
+                    let v = inp.value;
+                    if (['min', 'value', 'width', 'onValue', 'offValue'].includes(k)) v = v === '' ? '' : Number(v);
+                    // max 不做数字强制转换：数字或寄存器路径均保留原始字符串，运行时自动识别
+                    op[k] = v;
+                    if (k === 'type') {
+                        // 类型切换：用新类型重建该卡片（保留 op 数据），并保持原来的展开/折叠状态
+                        const wasOpen = card.classList.contains('open');
+                        const fresh = buildOpCard(op);
+                        if (wasOpen) fresh.classList.add('open');
+                        card.replaceWith(fresh);
+                        return;
+                    }
+                    card.querySelector('.smme-sum').innerHTML = opSummary(op);
+                });
+            });
+            // 寄存器快速检索下拉
+            card.querySelectorAll('[data-regsearch]').forEach(inp => {
+                const drop = inp.parentElement.querySelector('.smme-reg-drop');
+                if (drop) setupRegSearch(inp, drop, op);
+            });
+            return card;
+        }
+
+        // 维护 ops 数组与卡片的同步（按顺序）
+        const ops = initial.map(o => makeOp(o));
+        let renderList = function () {
+            listEl.innerHTML = '';
+            ops.forEach((op, i) => {
+                const card = buildOpCard(op);
+                card.querySelector('.smme-idx').textContent = (i + 1);
+                // 头部追加删除按钮
+                const del = document.createElement('span');
+                del.className = 'smme-del';
+                del.textContent = '✕';
+                del.title = '删除';
+                del.style.cssText = 'color:#94a3b8;cursor:pointer;font-size:13px;padding:2px 6px;';
+                del.addEventListener('click', () => {
+                    const idx = Array.prototype.indexOf.call(listEl.children, card);
+                    if (idx >= 0) { ops.splice(idx, 1); renderList(); }
+                });
+                card.querySelector('.smme-op-head').appendChild(del);
+                listEl.appendChild(card);
+            });
+        };
+        renderList();
+
+        // 删除操作（事件委托，兼容折叠态点击）
+        listEl.addEventListener('click', (e) => {
+            if (e.target.classList.contains('smme-del')) {
+                const idx = Array.prototype.indexOf.call(listEl.children, e.target.closest('.smme-op'));
+                if (idx >= 0) { ops.splice(idx, 1); renderList(); }
+            }
+        });
+
+        // 生成干净的 ops JSON 并写回目标文本框
+        function applyDef() {
+            const clean = ops.map(op => {
+                const o = { type: op.type, label: op.label };
+                if (op.register) o.register = op.register;
+                if (op.type === 'slider') {
+                    if (op.width != null && op.width !== '') o.width = Number(op.width);
+                    if (op.min != null && op.min !== '') o.min = Number(op.min);
+                    // max 保留原始字符串：数字（如 "255"）或寄存器路径（如 "TIM1.ARR"）均原样输出，运行时自动识别
+                    if (op.max != null && op.max !== '') o.max = op.max;
+                } else if (op.type === 'button') {
+                    if (op.style) o.style = op.style;
+                    if (op.value != null && op.value !== '') o.value = Number(op.value);
+                } else if (op.type === 'checkbox') {
+                    if (op.width != null && op.width !== '') o.width = Number(op.width);
+                    if (op.onValue != null && op.onValue !== '') o.onValue = Number(op.onValue);
+                    if (op.offValue != null && op.offValue !== '') o.offValue = Number(op.offValue);
+                } else if (op.type === 'text') {
+                    if (op.width != null && op.width !== '') o.width = Number(op.width);
+                    if (op.placeholder) o.placeholder = op.placeholder;
+                }
+                return o;
+            });
+            const json = JSON.stringify({ ops: clean });
+            const ta = dockMenu && dockMenu.menuControls[targetId];
+            if (ta) ta.value = json;
+            closeModal();
+        }
+
+        function closeModal() {
+            if (overlay.parentNode) overlay.remove();
+            document.removeEventListener('keydown', onKey, true);
+        }
+
+        // 阻止 mousedown 冒泡到 document（dock 菜单的“外部点击关闭”），菜单保持打开
+        overlay.addEventListener('mousedown', (e) => e.stopPropagation());
+        // 底部按钮
+        box.querySelector('.smme-add').addEventListener('click', () => {
+            const t = box.querySelector('.smme-type-select').value;
+            const op = makeOp({ type: t, label: '操作' + (ops.length + 1) });
+            ops.push(op);
+            renderList();
+            // 自动展开新加的卡片，立即看到字段
+            const cards = listEl.querySelectorAll('.smme-op');
+            const last = cards[cards.length - 1];
+            if (last) last.classList.add('open');
+        });
+        box.querySelector('.smme-cancel').addEventListener('click', closeModal);
+        box.querySelector('.smme-apply').addEventListener('click', applyDef);
+        overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
+        // 捕获阶段拦截 ESC，避免触发 dock 菜单自身的关闭
+        const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); closeModal(); } };
+        document.addEventListener('keydown', onKey, true);
+
+        return null;
+    }
+
     // ============ 自定义器件「右键菜单」：JSON 定义的操作（滑块/按钮）→ 直接写 SVD 寄存器 ============
     // JSON 形态（根对象含 ops 数组，或直接是数组）：
-    //   { "ops": [ { "type":"slider", "label":"PWM 占空比", "register":"TIMx.CCRn", "min":0, "maxRegister":"TIMx.ARR", "width":16 },
+    //   { "ops": [ { "type":"slider", "label":"PWM 占空比", "register":"TIMx.CCRn", "min":0, "max":"TIMx.ARR", "width":16 },
     //               { "type":"button", "label":"复位ARR", "register":"TIMx.ARR", "value":999 } ] }
+    // 滑块 max 自动识别：纯数字（如 255）直接使用；含点分路径（如 TIMx.ARR / TIM1.ARR）则读取该寄存器当前值作为最大量程。
     // register 支持通配：TIMx.CCRn / TIMx_CHn（x=实例号占位，n=通道号占位），会从器件连接推导实际 TIM 实例与通道。
     // 通道比较寄存器统一解析为本 MCU 真名：TIMx.CCRn→TIMx.CCn、TIMx_CHn→TIMx.CCn（CIU32F003x5 的 TIM CCR 命名为 CC1~CC4）。
 
@@ -736,11 +1113,11 @@ document.addEventListener('DOMContentLoaded', function () {
         return null;
     }
 
-    // 判断某 op 是否需要「已连接 TIM」才能解析：register / maxRegister 含 TIMx 通配（实例占位 x）
+    // 判断某 op 是否需要「已连接 TIM」才能解析：register / max 含 TIMx 通配（实例占位 x）
     // 例：TIMx.CCRn / TIMx.ARR / TIMx_CHn 需连接；TIM1.CC1 / CAN / BDTR 等具体名不需要
     function opNeedsConnection(op) {
         const r = (op.register || '').toString();
-        const mr = (op.maxRegister || '').toString();
+        const mr = (op.max || '').toString();
         // 通配占位符只认小写 x（TIMX 中的大写 X 不算通配），故用 /TIM[x]/（不含 i，避免 X 也被当通配）
         return /TIM[x]/.test(r) || /TIM[x]/.test(mr);
     }
@@ -776,12 +1153,53 @@ document.addEventListener('DOMContentLoaded', function () {
         nodeSystem.triggerCallback('onRegistersChanged', { ids: [key], reason: 'device-menu' });
     }
 
-    // 右键自定义器件节点：弹出 JSON 定义的操作菜单（RichMenu context），滑块即时写寄存器
+    // 右键自定义器件节点：弹出「右键菜单 JSON」定义的界面。
+    // 支持两种 JSON 格式：
+    //   1) 原来的 ops JSON（配置简单菜单生成的 { "ops":[...] } 或裸数组）
+    //      ——滑块/按钮/面板等直接写 SVD 寄存器，走原逻辑；
+    //   2) 面板导出的 JSON（PanelWorkbench.exportProject() 风格快照
+    //      { _meta, data, schema, layout, cells }）——直接据此构造并弹出运行时面板。
     function openCustomDeviceMenu(e, node) {
         const raw = node.config && node.config.deviceMenu;
         if (!raw) return; // 无菜单 → 事件冒泡给画布平移（等同“不使用弹出式菜单”）
         let parsed;
         try { parsed = JSON.parse(raw); } catch (err) { alert('右键菜单 JSON 解析失败：' + err.message); return; }
+        if (!parsed || typeof parsed !== 'object') { alert('右键菜单 JSON 格式无效'); return; }
+
+        // 面板导出 JSON：含典型快照键（layout 且 cells/data/schema/_meta 任一），直接构造面板
+        const isPanelJson = !Array.isArray(parsed) && !parsed.ops &&
+            ('layout' in parsed) &&
+            (('cells' in parsed) || ('data' in parsed) || ('schema' in parsed) || ('_meta' in parsed));
+        if (isPanelJson) {
+            e.preventDefault(); e.stopPropagation();
+            if (typeof PanelRuntime === 'undefined') { alert('面板运行环境未加载，无法弹出面板'); return; }
+            const pname = parsed._name || ((node.config.name || '自定义器件') + ' · 面板');
+            const key = node.nodeId;
+            const cached = devicePanelMap.get(key);
+            // 单例：该节点已有存活面板 → 直接提到前台（显示+置顶），不重复创建
+            if (cached && !cached._destroyed && cached.preview && cached.preview.win) {
+                const w = cached.preview.win;
+                w.show();
+                // 手动置顶（MacWindow 无程序化 focus，沿用其内部 _topZ 递增机制）
+                if (typeof MacWindow !== 'undefined') {
+                    MacWindow._topZ = (MacWindow._topZ || 10000) + 1;
+                    w.windowElement.style.zIndex = MacWindow._topZ;
+                }
+                return;
+            }
+            // 跟随鼠标弹出：用右键坐标作为窗口初始位置（含 4px 偏移避免压在光标下）
+            const rt = PanelRuntime.run(parsed, { name: pname, x: e.clientX + 4, y: e.clientY + 4 });
+            if (rt && rt.preview && rt.preview.win) {
+                devicePanelMap.set(key, rt);
+                // 面板关闭时从单例缓存移除（PanelRuntime 内部已负责释放与 registry 清理）
+                const win = rt.preview.win;
+                const prevClose = win.onWindowClose;
+                win.onWindowClose = () => { if (typeof prevClose === 'function') prevClose(); devicePanelMap.delete(key); };
+            }
+            return;
+        }
+
+        // 原来的 ops JSON：滑块/按钮/面板等操作 → 写 SVD 寄存器（原逻辑）
         const ops = Array.isArray(parsed) ? parsed : (parsed.ops || []);
         if (!ops.length) { alert('右键菜单 JSON 中未找到 ops 操作'); return; }
         e.preventDefault(); e.stopPropagation();
@@ -804,8 +1222,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 const reset = info.reset >>> 0;
                 const cur = getSvdRegVal(getNodeSvdKey(node), key, reset);
                 let max = (op.max != null) ? Number(op.max) : ((1 << (op.width || 16)) - 1);
-                if (op.maxRegister) {
-                    const mk = resolveRegSpec(op.maxRegister, node);
+                // max 自动识别：纯数字直接用；含 . 视为寄存器路径（如 TIM1.ARR），读取其当前值作为 max
+                if (op.max != null && /[.\w]/.test(String(op.max)) && isNaN(Number(op.max))) {
+                    const mk = resolveRegSpec(String(op.max), node);
                     const mi = mk && findSvdReg(mk);
                     if (mi) {
                         const mv = getSvdRegVal(getNodeSvdKey(node), mk, mi.reset >>> 0);
@@ -833,6 +1252,30 @@ document.addEventListener('DOMContentLoaded', function () {
                         const v = (op.value != null) ? Number(op.value) : info.reset;
                         writeSvdReg(key, v, info, getNodeSvdKey(node));
                     } });
+            } else if (op.type === 'checkbox') {
+                if (needsConn && !connected) {
+                    controls.push({ type: 'checkbox', id: cid, label: (op.label || op.register) + '  ［未连接 TIM · 已禁用］', checked: false, disabled: true });
+                    return;
+                }
+                const key = resolveRegSpec(op.register, node);
+                const info = key && findSvdReg(key);
+                const reset = info ? (info.reset >>> 0) : 0;
+                const onV = (op.onValue != null) ? Number(op.onValue) : 1;
+                const offV = (op.offValue != null) ? Number(op.offValue) : 0;
+                const cur = info ? getSvdRegVal(getNodeSvdKey(node), key, reset) : 0;
+                controls.push({ type: 'checkbox', id: cid, label: (op.label || key || op.register) + (key ? '  [' + key + ']' : ''), checked: (cur === onV) });
+                regMap[cid] = { key, onV, offV, regInfo: info };
+            } else if (op.type === 'text') {
+                if (needsConn && !connected) {
+                    controls.push({ type: 'text', id: cid, label: (op.label || op.register) + '  ［未连接 TIM · 已禁用］', disabled: true });
+                    return;
+                }
+                const key = resolveRegSpec(op.register, node);
+                const info = key && findSvdReg(key);
+                const reset = info ? (info.reset >>> 0) : 0;
+                const cur = info ? getSvdRegVal(getNodeSvdKey(node), key, reset) : 0;
+                controls.push({ type: 'text', id: cid, label: (op.label || key || op.register) + (key ? '  [' + key + ']' : ''), placeholder: (op.placeholder || ''), value: String(cur) });
+                regMap[cid] = { key, width: op.width || 16, regInfo: info };
             } else {
                 controls.push({ type: 'heading', label: '未知操作类型：' + (op.type || '?') });
             }
@@ -847,7 +1290,13 @@ document.addEventListener('DOMContentLoaded', function () {
         menu.onCancel(() => menu.hide());
         menu.onChange((id, value) => {
             const m = regMap[id];
-            if (m) { let v = Number(value); v = Math.min(Math.max(v, m.min), m.max); writeSvdReg(m.key, v, m.regInfo, getNodeSvdKey(node)); }
+            if (!m) return;
+            if (m.onV !== undefined) { // checkbox：按勾选状态写 on/off 值
+                const v = value ? m.onV : m.offV;
+                if (m.key && m.regInfo) writeSvdReg(m.key, v, m.regInfo, getNodeSvdKey(node));
+            } else {
+                let v = Number(value); v = Math.min(Math.max(v, m.min), m.max); writeSvdReg(m.key, v, m.regInfo, getNodeSvdKey(node));
+            }
         });
         menu.show(e.clientX, e.clientY);
     }
@@ -912,7 +1361,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 { title: '全局工作区（导出/导入整个工作区）', controls: [
                     { type: 'button', id: 'importWorkspace', label: '导入全局配置', onClick: () => workspaceFileInput.click() },
                     { type: 'button', id: 'exportWorkspace', label: '导出全局配置', style: 'success', onClick: () => window.exportWorkspace('workspace.json') },
-                    { type: 'heading', label: '包含：应用配置面板、MCU/外设收藏夹、接口初始化/函数面板、SVD 寄存器改动、用户 SVD 库与当前激活型号——相当于导出整个工作区。', span: 'full' }
+                    { type: 'heading', label: '包含：应用配置面板、MCU/外设收藏夹、接口初始化/函数面板、SVD 寄存器改动、用户 SVD 库与当前激活型号、自定义面板（数据/布局/单元格）——相当于导出整个工作区。', span: 'full' }
                 ] },
                 { title: '应用配置（本地存储 · config.json 仅导入导出）', controls: [
                     { type: 'button', id: 'loadCfg', label: '导入 config.json', onClick: () => configFileInput.click() },
@@ -1167,6 +1616,12 @@ document.addEventListener('DOMContentLoaded', function () {
     function grabLS(key) { try { const s = localStorage.getItem(key); return s == null ? null : JSON.parse(s); } catch (e) { return null; } }
     function grabLSRaw(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
     window.collectWorkspace = function () {
+        // 面板：命名存档（数据 + schema + 布局 + 表格单元格），存于 PanelWorkbench.PANEL_KEY
+        const panels = grabLS(PanelWorkbench && PanelWorkbench.PANEL_KEY ? PanelWorkbench.PANEL_KEY : 'pw_panels_v1');
+        // 导出前精简：剔除「值空且公式空」的单元格，避免工作区 JSON 充斥大量空单元格
+        if (panels && typeof panels === 'object' && PanelWorkbench && typeof PanelWorkbench.compactProject === 'function') {
+            Object.values(panels).forEach(p => PanelWorkbench.compactProject(p));
+        }
         return {
             _workspace: true,
             _version: 1,
@@ -1176,6 +1631,7 @@ document.addEventListener('DOMContentLoaded', function () {
             interfaceInits: grabLS('interfaceInits'),             // 接口初始化参数面板
             interfaceFunctions: grabLS('interfaceFunctions'),     // 接口函数定义面板
             svdRegValues: grabLS('svdRegValues'),                 // SVD 寄存器改动值
+            panels: panels,                                       // 自定义面板（含命名存档列表）
             svdLibrary: (window.SvdLib && window.SvdLib.getLibSnapshot) ? window.SvdLib.getLibSnapshot() : grabLS('svdLibrary'), // 用户导入的 SVD 库（可能存于 IndexedDB）
             svdActiveKey: grabLSRaw(window.SvdLib && window.SvdLib.LS_ACTIVE ? window.SvdLib.LS_ACTIVE : 'svdActiveKey') // 当前激活 SVD
         };
@@ -1192,6 +1648,11 @@ document.addEventListener('DOMContentLoaded', function () {
         putLS('interfaceInits', obj.interfaceInits);
         putLS('interfaceFunctions', obj.interfaceFunctions);
         putLS('svdRegValues', obj.svdRegValues);
+        // 面板命名存档：整体写回（覆盖式，names 以导入包为准）
+        if (obj.panels != null) {
+            const pk = (PanelWorkbench && PanelWorkbench.PANEL_KEY) ? PanelWorkbench.PANEL_KEY : 'pw_panels_v1';
+            putLS(pk, obj.panels);
+        }
         // SVD 库走 SvdLib 存储层（localStorage 不够时自动落 IndexedDB），不直接写 localStorage
         if (obj.svdLibrary != null && window.SvdLib && typeof window.SvdLib.setLibSnapshot === 'function') {
             window.SvdLib.setLibSnapshot(obj.svdLibrary);
@@ -1290,7 +1751,10 @@ document.addEventListener('DOMContentLoaded', function () {
         const mt = dockMenu && dockMenu.menuControls ? dockMenu.menuControls['devmenu'] : null;
         let menuRaw = (mt && mt.value && mt.value.trim()) ? mt.value.trim() : null;
         if (menuRaw) {
-            try { const p = JSON.parse(menuRaw); if (!Array.isArray(p) && !p.ops) throw new Error('缺少 ops 数组'); }
+            // 合法格式：ops 数组（含裸数组），或面板导出 JSON（含 layout 且带 cells/data/schema/_meta 之一）
+            const valid = (p) => (Array.isArray(p) || p.ops ||
+                (p.layout && (p.cells || p.data || p.schema || p._meta)));
+            try { const p = JSON.parse(menuRaw); if (typeof p !== 'object' || p === null || !valid(p)) throw new Error('非法格式（需 ops 数组或面板导出 JSON）'); }
             catch (err) { alert('右键菜单 JSON 解析失败：' + err.message); return; }
         }
         def.deviceMenu = menuRaw;

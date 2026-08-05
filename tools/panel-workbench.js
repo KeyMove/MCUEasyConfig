@@ -59,7 +59,7 @@ class PanelWorkbench {
             s.id = 'pw-dock-styles';
             s.textContent = `
 .pw-panel-menu {
-    position: fixed; z-index: 2000; width: 320px; max-height: 70vh; overflow: auto;
+    position: fixed; z-index: 100000; width: 320px; max-height: 70vh; overflow: auto;
     background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 10px;
     box-shadow: 0 20px 60px rgba(0,0,0,.5); padding: 12px; font-family: system-ui, sans-serif; font-size: 13px;
 }
@@ -71,6 +71,12 @@ class PanelWorkbench {
 .pw-panel-menu .ppm-name { flex: 1; background: #1e293b; border: 1px solid #334155; color: #fff;
     border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none; }
 .pw-panel-menu .ppm-name:focus { border-color: #0ea5e9; }
+.pw-panel-menu .ppm-global { display: flex; align-items: center; gap: 3px; color: #94a3b8; font-size: 12px;
+    white-space: nowrap; user-select: none; cursor: pointer; }
+.pw-panel-menu .ppm-global input { margin: 0; cursor: pointer; }
+.pw-panel-menu .ppm-tag { font-size: 10px; padding: 1px 5px; border-radius: 4px; line-height: 1.4; white-space: nowrap; }
+.pw-panel-menu .ppm-tag-g { background: #064e3b; color: #6ee7b7; }
+.pw-panel-menu .ppm-tag-s { background: #3b0764; color: #d8b4fe; }
 .pw-panel-menu .ppm-btn { background: #2563eb; color: #fff; border: none; border-radius: 5px;
     padding: 5px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .pw-panel-menu .ppm-btn:hover { background: #1d4ed8; }
@@ -78,6 +84,8 @@ class PanelWorkbench {
 .pw-panel-menu .ppm-empty { color: #64748b; text-align: center; padding: 14px 0; }
 .pw-panel-menu .ppm-item { display: flex; align-items: center; justify-content: space-between;
     background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 6px 8px; gap: 8px; }
+.pw-panel-menu .ppm-item[data-global="1"] { background: #0b3a2e; border-color: #0f6b4f; }
+.pw-panel-menu .ppm-item[data-global="0"] { background: #2a1840; border-color: #5b21b6; }
 .pw-panel-menu .ppm-item-name { cursor: pointer; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pw-panel-menu .ppm-item-name:hover { color: #7dd3fc; }
 .pw-panel-menu .ppm-item-actions { display: flex; gap: 4px; }
@@ -86,6 +94,8 @@ class PanelWorkbench {
 .pw-panel-menu .ppm-mini:hover { background: #475569; }
 .pw-panel-menu .ppm-del:hover { background: #b91c1c; }
 .pw-panel-menu .ppm-run { background: #15803d; color: #fff; }
+.pw-panel-menu .ppm-copy { background: #1d4ed8; color: #fff; }
+.pw-panel-menu .ppm-copy:hover { background: #2563eb; }
 .pw-panel-menu .ppm-run:hover { background: #16a34a; }
 .pw-panel-menu .ppm-run-cur { width: 100%; background: linear-gradient(180deg,#0ea5e9,#0284c7); color: #fff;
     border: none; border-radius: 7px; padding: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }
@@ -112,10 +122,13 @@ class PanelWorkbench {
             <button class="ppm-create">✚ 创建新面板</button>
             <div class="ppm-row">
                 <input type="text" class="ppm-name" placeholder="面板名称，如：温控面板">
+                <label class="ppm-global" title="勾选=存为全局（刷新不消失）；不勾=存为会话（刷新消失，但随画布 JSON 导出/加载）">
+                    <input type="checkbox" class="ppm-global-chk" checked> 全局
+                </label>
                 <button class="ppm-btn ppm-save">保存当前</button>
             </div>
             <div class="ppm-row">
-                <button class="ppm-btn ppm-run-cur" title="把当前工作台编译为独立运行实例（不依赖编辑窗口）">▶ 运行当前设计</button>
+                <button class="ppm-btn ppm-run-cur" title="把当前工作台作为独立实例运行（不依赖编辑窗口）">▶ 运行当前设计</button>
             </div>
             <div class="ppm-list"></div>
             <div class="ppm-hint">点面板名＝直接打开成品 · 点 ▶ ＝编译为独立实例(可多开) · 点 ✎ ＝打开并编辑</div>
@@ -138,15 +151,24 @@ class PanelWorkbench {
                 listEl.innerHTML = `<div class="ppm-empty">暂无已保存面板，点上方「创建新面板」开始</div>`;
                 return;
             }
-            listEl.innerHTML = names.map(n => `
-                <div class="ppm-item" data-name="${this._escAttr(n)}">
+            listEl.innerHTML = names.map(n => {
+                const p = panels[n] || {};
+                const isGlobal = p.global !== false;   // 默认全局
+                const tag = isGlobal
+                    ? '<span class="ppm-tag ppm-tag-g" title="全局：刷新不消失">全</span>'
+                    : '<span class="ppm-tag ppm-tag-s" title="会话：刷新消失，随画布 JSON 导出/加载">会话</span>';
+                return `
+                <div class="ppm-item" data-name="${this._escAttr(n)}" data-global="${isGlobal ? '1' : '0'}">
                     <span class="ppm-item-name" title="点击直接打开成品面板">${this._escHtml(n)}</span>
+                    ${tag}
                     <span class="ppm-item-actions">
-                        <button class="ppm-mini ppm-run" title="编译为独立运行实例（可多开）">▶</button>
+                        <button class="ppm-mini ppm-copy" title="复制此面板 JSON 到剪贴板">⧉</button>
+                        <button class="ppm-mini ppm-run" title="运行独立实例（可多开）">▶</button>
                         <button class="ppm-mini ppm-edit" title="打开并编辑">✎</button>
                         <button class="ppm-mini ppm-del" title="删除">🗑</button>
                     </span>
-                </div>`).join('');
+                </div>`;
+            }).join('');
         };
         renderList();
 
@@ -162,7 +184,8 @@ class PanelWorkbench {
         // 保存当前
         menu.querySelector('.ppm-save').addEventListener('click', () => {
             const name = menu.querySelector('.ppm-name').value;
-            const r = this.savePanel(name);
+            const global = menu.querySelector('.ppm-global-chk').checked;
+            const r = this.savePanel(name, { global });
             this._ppmToast(menu, r.msg);
             renderList();
         });
@@ -185,6 +208,20 @@ class PanelWorkbench {
             const item = e.target.closest('.ppm-item');
             if (!item) return;
             const name = item.dataset.name;
+            if (e.target.classList.contains('ppm-copy')) {
+                // 复制单个面板的完整 JSON 到剪贴板
+                const panels = this.listPanels();
+                const proj = panels[name];
+                if (!proj) { this._ppmToast(menu, `复制失败：面板「${name}」不存在`); return; }
+                const json = JSON.stringify(proj, null, 2);
+                const done = () => this._ppmToast(menu, `已复制「${name}」的 JSON 到剪贴板`);
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(json).then(done).catch(() => this._copyText(json).then(done).catch(() => this._ppmToast(menu, '复制失败，请手动复制')));
+                } else {
+                    this._copyText(json).then(done).catch(() => this._ppmToast(menu, '复制失败，请手动复制'));
+                }
+                return;
+            }
             if (e.target.classList.contains('ppm-del')) {
                 const r = this.deletePanel(name);
                 this._ppmToast(menu, r.msg);
@@ -246,7 +283,12 @@ class PanelWorkbench {
         const p = this._layoutPositions();
         // 强制重排到四宫格标准位置（像第一次打开一样）
         if (this.excelWin)   { this.excelWin.setSize(p.w, p.h);   this.excelWin.setPosition(p.excel.x, p.excel.y); }
-        if (this.preview && this.preview.win) { this.preview.win.setSize(p.w, p.h); this.preview.win.setPosition(p.preview.x, p.preview.y); }
+        // 成品窗口：若加载的面板保存过尺寸则沿用（用户拖拽调整后的），否则用四宫格标准尺寸。
+        if (this.preview && this.preview.win) {
+            const ps = this._loadedPreviewSize || { w: p.w, h: p.h };
+            this.preview.win.setSize(ps.w, ps.h);
+            this.preview.win.setPosition(p.preview.x, p.preview.y);
+        }
         if (this.layout && this.layout.win)   { this.layout.win.setSize(p.w, p.h);  this.layout.win.setPosition(p.layout.x, p.layout.y); }
         if (this.editorWin)  { this.editorWin.setSize(p.w, p.h);  this.editorWin.setPosition(p.editor.x, p.editor.y); }
         this.excelWin && this.excelWin.show();
@@ -282,6 +324,21 @@ class PanelWorkbench {
 
     _escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     _escAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+    // 复制文本到剪贴板的兜底方案（无 navigator.clipboard 或 http 环境可用）
+    _copyText(text) {
+        return new Promise((resolve, reject) => {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;';
+                document.body.appendChild(ta);
+                ta.focus(); ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                ok ? resolve() : reject(new Error('execCommand copy failed'));
+            } catch (e) { reject(e); }
+        });
+    }
 
     // ==================== ② 表格窗口 ====================
     _createExcelWindow(x, y, w, h) {
@@ -355,6 +412,10 @@ class PanelWorkbench {
                 this._syncEditorToExcel(changedPath);
                 this._refreshPushedDefs();
             },
+            // 控件改名：同步更新布局里已推送控件的 srcPath（及派生 id），避免改名后布局错乱
+            onRenameKey: (oldPathStr, newPathStr) => {
+                this._onEditorRenameKey(oldPathStr, newPathStr);
+            },
         });
 
         this.editor.setObj(
@@ -373,6 +434,51 @@ class PanelWorkbench {
         const s = this.editor.getSchema()[pathStr];
         if (s && s.cell && this.excel.hasCell(s.cell)) {
             this.excel.setCell(s.cell, this.editor.getByPath(changedPath));
+        }
+    }
+
+    /** 控件改名：把布局里已推送控件的 srcPath（及派生 id）同步到新路径，并刷新定义与选中态 */
+    _onEditorRenameKey(oldPathStr, newPathStr) {
+        if (!this.layout) return;
+        const newId = 'ctl_' + newPathStr.replace(/[^A-Za-z0-9]/g, c => '_' + c.charCodeAt(0).toString(16) + '_');
+        let path = null;
+        try { path = JSON.parse(newPathStr); } catch (e) { path = null; }
+        if (this._refreshing) return;   // 防重入
+        this._refreshing = true;
+        try {
+            this.layout.defs.forEach(d => {
+                if (d.srcPath !== oldPathStr) return;
+                // 迁移 items map 中的 DOM 到新 id（避免残留旧 DOM 导致布局错乱）
+                if (d.id !== newId) {
+                    const oldEl = this.layout.items.get(d.id);
+                    if (oldEl) {
+                        this.layout.items.delete(d.id);
+                        oldEl.dataset.id = newId;
+                        this.layout.items.set(newId, oldEl);
+                    }
+                    // 同步选中态
+                    if (this.layout.selectedIds && this.layout.selectedIds.has(d.id)) {
+                        this.layout.selectedIds.delete(d.id);
+                        this.layout.selectedIds.add(newId);
+                    }
+                    if (this.layout.selectedId === d.id) this.layout.selectedId = newId;
+                }
+                // 更新 srcPath 与 id
+                d.srcPath = newPathStr;
+                d.id = newId;
+                // 用新路径重新生成控件定义（label 等），保留位置
+                if (path) {
+                    const fresh = this.editor.buildControlDef(path);
+                    if (fresh) {
+                        const { x, y, w, h } = d;
+                        Object.assign(d, fresh, { x, y, w, h });
+                    }
+                }
+                this.layout._renderItem(d);
+            });
+            this.layout._emit();
+        } finally {
+            this._refreshing = false;
         }
     }
 
@@ -473,12 +579,20 @@ class PanelWorkbench {
 
     /** 导出整套设计（数据 + schema + 布局 + 表格单元格），可持久化 */
     exportProject() {
+        // 成品窗口的当前实际尺寸（用户拖拽调整后的），保存下来以便还原时沿用，
+        // 而不是每次都用固定的初始四宫格尺寸。
+        let pvW = null, pvH = null;
+        if (this.preview && this.preview.win) {
+            pvW = this.preview.win.options.width;
+            pvH = this.preview.win.options.height;
+        }
         return {
             _meta: { type: 'panel-workbench', version: 1, exportedAt: new Date().toISOString() },
             data: this.editor.getObj(),
             schema: this.editor.getSchema(),
             layout: this.layout.exportLayout(),
             cells: this.excel ? this.excel.dumpCellData() : {},
+            preview: (pvW != null && pvH != null) ? { w: pvW, h: pvH } : null,
         };
     }
 
@@ -494,49 +608,138 @@ class PanelWorkbench {
             this.excel.loadCellData(proj.cells, { recalc: !!opts.recalc });
         }
         if (proj.layout) this.layout.setDefs(proj.layout);
+        // 还原时沿用保存的成品窗口尺寸（用户拖拽调整后的），而非固定初始尺寸。
+        if (proj.preview && proj.preview.w && proj.preview.h && this.preview && this.preview.win) {
+            this.preview.win.setSize(proj.preview.w, proj.preview.h);
+            this._loadedPreviewSize = { w: proj.preview.w, h: proj.preview.h };
+        } else {
+            this._loadedPreviewSize = null;
+        }
         return true;
     }
 
     // ==================== 面板（命名存档）：保存/打开/编辑/加载 ====================
-    // 面板 = 一套完整的「数据 + schema + 布局 + 表格单元格」，存于 localStorage。
+    // 面板 = 一套完整的「数据 + schema + 布局 + 表格单元格」。
+    // 两种持久化方式：
+    //   ① 全局（global=true）：存入 localStorage（PanelWorkbench.PANEL_KEY），刷新页面不消失。
+    //   ② 会话（global=false）：仅存内存（PanelWorkbench._sessionPanels），刷新页面即消失，
+    //      但会随「画布 JSON」一起导出/加载（见 exportCanvasPanels / importCanvasPanels）。
 
     static PANEL_KEY = 'pw_panels_v1';
+    /** 非全局面板的会话内存存储（刷新即清空）。结构与 localStorage 一致：{ name: proj } */
+    static _sessionPanels = {};
 
-    /** 读取所有已保存面板名 -> 元信息 */
-    listPanels() {
-        try {
-            return JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}');
-        } catch (e) { return {}; }
+    /** 把面板工程里的 cells 精简：删除「值空且公式空」的单元格，减小导出体积 */
+    static compactProject(proj) {
+        if (!proj || !proj.cells || typeof proj.cells !== 'object') return proj;
+        const compacted = {};
+        for (const [k, v] of Object.entries(proj.cells)) {
+            if (!v) continue;
+            const val = v.value;
+            const hasVal = val !== '' && val !== null && val !== undefined;
+            const hasFormula = !!(v.formula && String(v.formula).trim());
+            if (hasVal || hasFormula) compacted[k] = { value: val, formula: v.formula || '' };
+        }
+        proj.cells = compacted;
+        return proj;
     }
 
-    /** 保存当前工作台为命名面板（覆盖同名） */
-    savePanel(name) {
+    /** 读取所有面板（localStorage 全局 + 会话内存），同名校验会话优先 */
+    listPanels() {
+        let ls = {};
+        try { ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}'); } catch (e) { ls = {}; }
+        return Object.assign({}, ls, PanelWorkbench._sessionPanels);
+    }
+
+    /** 判断某面板名是否存在于指定存储（'global' | 'session' | 'any'） */
+    static _hasPanel(name, where) {
+        if (where === 'global' || where === 'any') {
+            try {
+                const ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}');
+                if (ls[name]) return true;
+            } catch (e) {}
+        }
+        if (where === 'session' || where === 'any') {
+            if (PanelWorkbench._sessionPanels[name]) return true;
+        }
+        return false;
+    }
+
+    /** 保存当前工作台为命名面板（覆盖同名）。
+     * @param {string} name 面板名
+     * @param {Object} [opts] { global:true } true=存 localStorage（刷新不消失），false=存会话内存（刷新消失，随画布 JSON 走）
+     */
+    savePanel(name, opts = {}) {
         name = (name || '').trim();
         if (!name) return { ok: false, msg: '面板名不能为空' };
-        const all = this.listPanels();
-        all[name] = Object.assign(this.exportProject(), {
-            _name: name, savedAt: new Date().toISOString(),
+        const global = opts.global !== false;   // 默认全局
+        const proj = Object.assign(this.exportProject(), {
+            _name: name, savedAt: new Date().toISOString(), global,
         });
-        localStorage.setItem(PanelWorkbench.PANEL_KEY, JSON.stringify(all));
-        return { ok: true, msg: `已保存面板「${name}」` };
+        if (global) {
+            let ls = {};
+            try { ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}'); } catch (e) { ls = {}; }
+            ls[name] = proj;
+            localStorage.setItem(PanelWorkbench.PANEL_KEY, JSON.stringify(ls));
+            // 存为全局后，从会话内存移除同名（避免重复/歧义）
+            delete PanelWorkbench._sessionPanels[name];
+        } else {
+            PanelWorkbench._sessionPanels[name] = proj;
+        }
+        return { ok: true, msg: `已保存面板「${name}」（${global ? '全局·刷新不消失' : '会话·随画布导出'}）` };
     }
 
-    /** 打开/加载一个已保存面板（底层赋值，不触发运算，除非 recalc） */
+    /** 打开/加载一个已保存面板（底层赋值，不触发运算，除非 recalc）。会话优先于全局。 */
     loadPanel(name, opts = {}) {
-        const all = this.listPanels();
-        const proj = all[name];
+        const proj = PanelWorkbench._sessionPanels[name]
+            || (() => { try { return JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}')[name]; } catch (e) { return null; } })();
         if (!proj) return { ok: false, msg: `面板「${name}」不存在` };
         this.importProject(proj, opts);
         return { ok: true, msg: `已加载面板「${name}」` };
     }
 
-    /** 删除一个面板 */
+    /** 删除一个面板（会话 + 全局都尝试删） */
     deletePanel(name) {
-        const all = this.listPanels();
-        if (!all[name]) return { ok: false, msg: `面板「${name}」不存在` };
-        delete all[name];
-        localStorage.setItem(PanelWorkbench.PANEL_KEY, JSON.stringify(all));
-        return { ok: true, msg: `已删除面板「${name}」` };
+        let existed = false;
+        if (PanelWorkbench._sessionPanels[name]) { delete PanelWorkbench._sessionPanels[name]; existed = true; }
+        try {
+            const ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}');
+            if (ls[name]) { delete ls[name]; localStorage.setItem(PanelWorkbench.PANEL_KEY, JSON.stringify(ls)); existed = true; }
+        } catch (e) {}
+        return existed ? { ok: true, msg: `已删除面板「${name}」` } : { ok: false, msg: `面板「${name}」不存在` };
+    }
+
+    /** 导出所有面板给「画布 JSON」：返回带 global 标志的数组（全局 + 会话合并，会话优先） */
+    static exportCanvasPanels() {
+        let ls = {};
+        try { ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}'); } catch (e) { ls = {}; }
+        const merged = Object.assign({}, ls, PanelWorkbench._sessionPanels);
+        return Object.values(merged).map(p => {
+            const c = JSON.parse(JSON.stringify(p));   // 深拷贝，避免外部改动污染
+            if (typeof c.global !== 'boolean') c.global = !!(ls[c._name]);  // 兜底：来源全局即标 true
+            return c;
+        });
+    }
+
+    /** 从「画布 JSON」导入面板：按 global 标志写回对应存储（true→localStorage，false→会话内存） */
+    static importCanvasPanels(arr) {
+        if (!Array.isArray(arr)) return;
+        // 画布 JSON 代表「完整面板集」：导入前清空会话内存（全局面板仍由 localStorage 合并保留）
+        PanelWorkbench._sessionPanels = {};
+        let ls = {};
+        try { ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}'); } catch (e) { ls = {}; }
+        arr.forEach(p => {
+            if (!p || !p._name) return;
+            const proj = JSON.parse(JSON.stringify(p));
+            const global = proj.global !== false;   // 默认全局
+            if (global) {
+                ls[proj._name] = proj;
+                delete PanelWorkbench._sessionPanels[proj._name];
+            } else {
+                PanelWorkbench._sessionPanels[proj._name] = proj;
+            }
+        });
+        localStorage.setItem(PanelWorkbench.PANEL_KEY, JSON.stringify(ls));
     }
 
     /** 重命名面板（先删旧再存新，保留内容） */

@@ -23,54 +23,139 @@ class PanelRuntime {
      * @param {number} [opts.rows=16]
      * @param {number} [opts.cols=12]
      * @param {boolean} [opts.center=true] 成品窗口是否居中
+     * @param {boolean} [opts.headless=false] 无头模式：仅用 Excel 数据引擎，不创建任何 DOM/
+     *        成品窗口，可作为菜单基础组件被无 UI 调用（如取 getDefines() 投射 C 宏）。
+     *        需要显示成品时再调用 attachDOM() 关联前端。
      */
     constructor(proj, opts = {}) {
         if (!proj) throw new Error('PanelRuntime: 缺少面板工程快照(proj)');
         this.name = (opts.name || proj._name || '面板').trim() || '面板';
+        // 唯一实例 id（区别于 name）：注册表按 id 存放，使同名面板也可多开并存。
+        PanelRuntime._seq = (PanelRuntime._seq || 0) + 1;
+        this.id = 'rt_' + PanelRuntime._seq;
+        // 同名序号：类 Windows 文件重命名——扫描当前已运行的同名实例占用的序号，
+        // 从 1 开始取最小未占用的正整数（关掉一个后该空缺会被复用，不会无限自增）。
+        const used = new Set();
+        PanelRuntime.registry.forEach(rt => { if (rt && rt.name === this.name && rt._index) used.add(rt._index); });
+        let idx = 1;
+        while (used.has(idx)) idx++;
+        this._index = idx;
         this.proj = proj;
         this.rows = opts.rows || 16;
         this.cols = opts.cols || 12;
+        this.headless = !!opts.headless;
+        // 初始位置（如右键点坐标）：设置后窗口不居中，直接落在该位置（含视口边界保护）
+        this._initX = (typeof opts.x === 'number') ? opts.x : null;
+        this._initY = (typeof opts.y === 'number') ? opts.y : null;
 
         // 1) 独立数据总线（每个实例 new 一个，bindings/cellData 全部实例隔离）
-        const host = document.createElement('div');
-        host.style.cssText = 'position:fixed;left:-99999px;top:0;width:10px;height:10px;overflow:hidden;';
-        document.body.appendChild(host);
-        this._excelHost = host;
-        this.excel = new ExcelTable(host, this.rows, this.cols, { dark: true });
-        // 运行态表格同样支持「右键填 SWD 变量」（编译出的面板若含 AXF 符号可用）
-        if (typeof attachSwdVarMenu === 'function') attachSwdVarMenu(this.excel);
+        //    无头模式：用 headless:true 的 ExcelTable，不创建 DOM/样式/定时器，纯数据引擎。
+        if (this.headless) {
+            this.excel = new ExcelTable(null, this.rows, this.cols, { headless: true });
+        } else {
+            const host = document.createElement('div');
+            host.style.cssText = 'position:fixed;left:-99999px;top:0;width:10px;height:10px;overflow:hidden;';
+            document.body.appendChild(host);
+            this._excelHost = host;
+            this.excel = new ExcelTable(host, this.rows, this.cols, { dark: true });
+            // 运行态表格同样支持「右键填 SWD 变量」（编译出的面板若含 AXF 符号可用）
+            if (typeof attachSwdVarMenu === 'function') attachSwdVarMenu(this.excel);
+        }
 
-        // 2) 独立成品窗口（运行态真控件）
+        // 2) 成品窗口（运行态真控件）：无头模式暂不创建，后续 attachDOM() 时再建
+        this.preview = null;
+        // 控件定义（defs）：无论是否无头都从快照布局提取，供 getDefines() 投射 C 宏
+        // （无头无 PreviewWindow，但 layout 里已含 define 控件的 macroName/cell/defValue）。
+        this.defs = Array.isArray(proj.layout) ? proj.layout.slice() : [];
+        if (!this.headless) {
+            this._buildPreview();
+        }
+
+        // 3) 用快照「刷」出数据 + 布局（底层赋值不触发运算，最后整体 recalc 一次）
+        if (proj.cells) this.excel.loadCellData(proj.cells, { recalc: false });
+        if (!this.headless && proj.layout) this.preview.setLayout(proj.layout);
+        // 让公式/绑定全部生效：依赖图在 setLayout -> bindCell 时建立，这里跑一次整体重算
+        if (typeof this.excel.recalculateAll === 'function') this.excel.recalculateAll();
+        // 再同步一次控件显示（以表格当前值为准）——无头无控件，跳过
+        if (!this.headless && this.preview) this.preview.syncFromExcel();
+
+        // 4) 注册到全局运行实例表（按唯一 id，支持同名多开）
+        PanelRuntime.registry.set(this.id, this);
+    }
+
+    /** 构建成品窗口（从快照布局渲染真控件） */
+    _buildPreview() {
+        // 沿用保存的成品窗口尺寸（用户拖拽调整后的），而非固定 460x420。
+        const saved = (this.proj && this.proj.preview) || null;
+        const w = (saved && saved.w) ? saved.w : 460;
+        const h = (saved && saved.h) ? saved.h : 420;
+        // 窗口标题：同名多开时显示「#n」序号，便于区分
+        const title = (this._index > 1) ? `${this.name} #${this._index}` : this.name;
+        // 未指定初始位置（非右键跟随）时，按同名序号错位偏移，避免多开窗口完全重叠
+        const offset = (this._index - 1) * 28;
+        const x = (this._initX != null) ? this._initX
+            : Math.min(window.innerWidth - w, Math.max(0, window.innerWidth / 2 - w / 2 + offset));
+        const y = (this._initY != null) ? this._initY
+            : Math.min(window.innerHeight - h, Math.max(0, window.innerHeight / 2 - h / 2 + offset));
         this.preview = new PreviewWindow({
             excel: this.excel,
             onValueChange: (def, v) => {
                 if (this.onValueChange) this.onValueChange(def, v, this);
             },
             windowOpts: {
-                title: this.name,
-                x: window.innerWidth / 2 - 230,
-                y: 80,
-                width: 460, height: 420,
+                title,
+                x, y,
+                width: w, height: h,
                 show: false,
             },
         });
-
-        // 3) 用快照「刷」出数据 + 布局（底层赋值不触发运算，最后整体 recalc 一次）
-        if (proj.cells) this.excel.loadCellData(proj.cells, { recalc: false });
-        if (proj.layout) this.preview.setLayout(proj.layout);
-        // 让公式/绑定全部生效：依赖图在 setLayout -> bindCell 时建立，这里跑一次整体重算
-        if (typeof this.excel.recalculateAll === 'function') this.excel.recalculateAll();
-        // 再同步一次控件显示（以表格当前值为准）
+        // 关闭运行实例窗口时真正释放本实例（从 registry 移除），使同名序号可被后续复用，
+        // 避免窗口关掉后 registry 泄漏导致下次运行序号越开越大。
+        if (this.preview.win) {
+            const self = this;
+            this.preview.win.onWindowClose = () => { self.destroy(); };
+        }
+        if (this.proj && this.proj.layout) this.preview.setLayout(this.proj.layout);
         this.preview.syncFromExcel();
+        return this.preview;
+    }
 
-        // 4) 注册到全局运行实例表
-        PanelRuntime.registry.set(this.name, this);
+    /**
+     * 无头实例关联前端：把 headless 的 Excel 数据引擎挂上真实 DOM，并创建成品窗口。
+     * 无头期已写入的单元格数据/公式/依赖图会被保留（addRows 仅替换 input 镜像）。
+     * @param {Object} [opts] { attachContainer } 仅用于 ExcelTable.attachDOM（通常离屏即可）
+     */
+    attachDOM(opts = {}) {
+        if (!this.headless) return this; // 已非无头，无需再挂
+        this.headless = false;
+        // 先给 Excel 关联前端（建 DOM、启动 TIMER）
+        const host = document.createElement('div');
+        host.style.cssText = 'position:fixed;left:-99999px;top:0;width:10px;height:10px;overflow:hidden;';
+        document.body.appendChild(host);
+        this._excelHost = host;
+        this.excel.attachDOM(host, { dark: true });
+        if (typeof attachSwdVarMenu === 'function') attachSwdVarMenu(this.excel);
+        // 再建成品窗口（布局/重算已在构造期完成，这里直接渲染）
+        this._buildPreview();
+        return this;
     }
 
     /** 显示成品窗口（运行态入口） */
     show() {
         this.preview && this.preview.win && this.preview.win.show();
-        if (this.preview && this.preview.win) this.preview.win.center();
+        if (this.preview && this.preview.win) {
+            // 窗口位置已由 _buildPreview 按「右键坐标 / 多开错位」算好，
+            // 直接落到该坐标并做视口边界保护（不再强制 center，避免覆盖前一个同名实例）。
+            const win = this.preview.win;
+            const ww = win.options.width, wh = win.options.height;
+            const vw = window.innerWidth, vh = window.innerHeight;
+            let x = win.options.x, y = win.options.y;
+            if (x + ww > vw) x = Math.max(0, vw - ww);
+            if (y + wh > vh) y = Math.max(0, vh - wh);
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            win.setPosition(x, y);
+        }
         return this;
     }
 
@@ -105,7 +190,7 @@ class PanelRuntime {
      */
     getDefines() {
         const defines = {};
-        const defs = (this.preview && this.preview.defs) || [];
+        const defs = this.defs || [];
         defs.forEach(d => {
             if (d.type !== 'define') return;
             let name = (d.macroName || d.label || '').trim();
@@ -146,12 +231,12 @@ class PanelRuntime {
 
     /** 销毁本运行实例，释放 DOM 与绑定，并从注册表移除 */
     destroy() {
+        if (this._destroyed) return this;
+        this._destroyed = true;
         if (this.preview) this.preview.destroy();
-        if (this.excel) {
-            // ExcelTable 自身没有 destroy，但绑定的 input 随 host 移除即可回收
-        }
+        if (this.excel && typeof this.excel.destroy === 'function') this.excel.destroy();
         if (this._excelHost && this._excelHost.parentNode) this._excelHost.remove();
-        PanelRuntime.registry.delete(this.name);
+        PanelRuntime.registry.delete(this.id);
         return this;
     }
 
@@ -169,17 +254,18 @@ class PanelRuntime {
     static openCompiledPanel(name, opts = {}) {
         name = (name || '').trim();
         if (!name) return null;
-        // 已运行则先销毁旧实例（可能指向被覆盖前的旧快照），再按最新 localStorage 重建，
-        // 保证「保存覆盖/删除重建」后打开的是最新版，而不是残留的旧实例。
-        const existing = PanelRuntime.registry.get(name);
-        if (existing) { existing.destroy(); }
+        // 支持同名多开：不再因同名销毁旧实例，直接新建一份独立实例。
 
-        const all = PanelRuntime._loadStore();
-        const proj = all[name];
+        // 会话面板（global=false）只存在内存 PanelWorkbench._sessionPanels，不写 localStorage，
+        // 所以先查 localStorage，查不到再回退会话内存（会话优先于全局，与 loadPanel 保持一致）。
+        let proj = PanelRuntime._loadStore()[name];
+        if (!proj && typeof PanelWorkbench !== 'undefined' && PanelWorkbench._sessionPanels) {
+            proj = PanelWorkbench._sessionPanels[name] || null;
+        }
         if (!proj) { console.warn(`PanelRuntime: 面板「${name}」不存在`); return null; }
 
         const rt = new PanelRuntime(proj, Object.assign({ name }, opts));
-        rt.show();
+        if (!rt.headless) rt.show();
         return rt;
     }
 
@@ -190,10 +276,9 @@ class PanelRuntime {
      */
     static run(proj, opts = {}) {
         const name = (opts.name || proj._name || '面板').trim() || '面板';
-        const existing = PanelRuntime.registry.get(name);
-        if (existing) { existing.destroy(); }   // 同名先替换，保证运行的是最新版
+        // 支持同名多开：每次都新建独立实例，不再替换旧实例。
         const rt = new PanelRuntime(proj, Object.assign({ name }, opts));
-        rt.show();
+        if (!rt.headless) rt.show();
         return rt;
     }
 
@@ -203,8 +288,10 @@ class PanelRuntime {
     }
 }
 
-// 多实例注册表：name -> PanelRuntime，用于「通知打开多个面板无干扰运行」
+// 多实例注册表：id -> PanelRuntime，用于「通知打开多个面板无干扰运行」
 PanelRuntime.registry = new Map();
+// 实例唯一序号（仅用于生成唯一 id，标题序号由运行时实时统计同名数得到）
+PanelRuntime._seq = 0;
 
 if (typeof window !== 'undefined') {
     window.PanelRuntime = PanelRuntime;

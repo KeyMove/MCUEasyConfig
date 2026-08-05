@@ -27,6 +27,9 @@ class RichObjectEditor {
         // 点击时把该节点的控件定义（path + schema + 当前值）推给回调。
         this.onPushControl = options.onPushControl || null;
         this.enablePush = !!options.onPushControl;
+        // 「控件改名」回调：双击左侧控件名字重命名后，把「旧路径 -> 新路径」广播出去，
+        // 便于外部（如布局窗口）同步更新引用（def.srcPath），避免改名后布局错乱。
+        this.onRenameKey = options.onRenameKey || null;
 
         // 搜索
         this.searchCache = new Map();
@@ -145,6 +148,10 @@ class RichObjectEditor {
         }
         this.renderTree();
         this._notifyChange();
+        // 广播改名：让外部按「旧路径 -> 新路径」同步引用（如布局窗口 def.srcPath）
+        if (typeof this.onRenameKey === 'function') {
+            try { this.onRenameKey(oldPathStr, newPathStr); } catch (e) { console.error('onRenameKey 回调出错', e); }
+        }
     }
 
     _notifyChange() {
@@ -197,7 +204,8 @@ class RichObjectEditor {
             value: s.value !== undefined ? s.value : value,
             cell: s.cell || null,                   // 关联的 Excel 单元格（可在 schema 里配置）
         };
-        ['min', 'max', 'step', 'unit', 'placeholder', 'options', 'rows'].forEach(k => {
+        ['min', 'max', 'step', 'unit', 'placeholder', 'options', 'rows',
+         'series', 'showPoints', 'follow'].forEach(k => {
             if (s[k] !== undefined) def[k] = s[k];
         });
         return def;
@@ -1050,6 +1058,7 @@ class RichObjectEditor {
             { type: 'label', icon: '🏷️', name: '标签' },
             { type: 'button', icon: '🔘', name: '按钮' },
             { type: 'define', icon: '📐', name: 'define 投射' },
+            { type: 'chart', icon: '📈', name: '波形图' },
         ];
 
         // 显示路径和原始key信息
@@ -1233,6 +1242,22 @@ class RichObjectEditor {
                 源码里可直接使用而无需手写 #define。单元格支持 JS 表达式，可实现「面板值 → 宏」的灵活生成。</div>`;
         }
 
+        // 波形图控件：用 WaveChart 渲染实时曲线，数据源来自一个或多个关联单元格
+        // （每个单元格是一个 series，单元格值为该通道最新样本；支持 JS 公式实时算出波形数据）。
+        if (type === 'chart') {
+            html += `<div class="roe-schema-row"><label>系列名称 (series) — 多个系列用英文逗号分隔，每个系列对应一个关联单元格；留空则自动用单元格名</label>
+                <input type="text" id="roe-cfg-series" value="${this._escapeHtml(s.series || '')}" placeholder="如: CH1,CH2"></div>`;
+            html += `<div class="roe-schema-row"><label>关联单元格 (cell) — 一个或多个单元格（用英文逗号分隔），每个单元格作为一个波形通道的数据源</label>
+                <input type="text" id="roe-cfg-cell" value="${this._escapeHtml(s.cell || '')}" placeholder="如: A1 / A1,B1 / C1,D1,E1"></div>`;
+            html += `<div class="roe-schema-row"><label>可见窗口点数 (showPoints) — 同时显示多少个采样点（默认 200）</label>
+                <input type="text" id="roe-cfg-showpoints" value="${s.showPoints !== undefined ? s.showPoints : ''}" placeholder="200"></div>`;
+            html += `<div class="roe-schema-row" style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="roe-cfg-follow" ${s.follow ? 'checked' : ''}>
+                <label style="margin:0;">跟随最新 (live) — 新数据从右侧进入，保持实时滚动</label></div>`;
+            html += `<div style="font-size:11px; color:#64748b; line-height:1.6; margin-top:4px;">
+                作用：把<b style="color:#38bdf8">关联单元格的实时值</b>作为波形采样点绘成曲线，单元格变化（来自滑块/JS 公式等）即实时刷新波形。</div>`;
+        }
+
         html += '</div>';
         area.innerHTML = html;
 
@@ -1309,6 +1334,25 @@ class RichObjectEditor {
             if (mn && mn.value.trim()) config.macroName = mn.value.trim();
             const body = this._$('roe-cfg-define-body');
             if (body && body.value !== '') config.defValue = body.value;
+        }
+
+        // 波形图控件：收集系列名、关联单元格、窗口点数与跟随选项
+        if (type === 'chart') {
+            const seriesEl = this._$('roe-cfg-series');
+            if (seriesEl && seriesEl.value.trim()) {
+                config.series = seriesEl.value.split(',').map(s => s.trim()).filter(Boolean);
+            }
+            const cellEl = this._$('roe-cfg-cell');
+            if (cellEl && cellEl.value.trim()) {
+                config.cell = cellEl.value.split(',').map(c => c.trim().toUpperCase()).filter(Boolean).join(',');
+            }
+            const spEl = this._$('roe-cfg-showpoints');
+            if (spEl && spEl.value !== '') {
+                const n = parseInt(spEl.value, 10);
+                if (!Number.isNaN(n) && n > 0) config.showPoints = n;
+            }
+            const followEl = this._$('roe-cfg-follow');
+            if (followEl && followEl.checked) config.follow = true;
         }
 
         return config;
@@ -1395,6 +1439,12 @@ class RichObjectEditor {
         const newPathStr = JSON.stringify(newPath);
         if (this.schema.has(oldPathStr)) {
             const def = this.schema.get(oldPathStr);
+            // 控件显示名默认跟随 key：若 label 未单独配置（等于旧 key），则同步改成新 key，
+            // 否则改名后布局/成品区仍显示旧名称
+            if (def && (def.label === undefined || def.label === null || def.label === oldKey || def.keyAlias === oldKey)) {
+                if (def.label === oldKey) def.label = newKey;
+                if (def.keyAlias === oldKey) def.keyAlias = newKey;
+            }
             this.schema.delete(oldPathStr);
             this.schema.set(newPathStr, def);
         }
@@ -1421,6 +1471,10 @@ class RichObjectEditor {
 
         this.renderTree();
         this._notifyChange();
+        // 广播改名：让外部按「旧路径 -> 新路径」同步引用（如布局窗口 def.srcPath）
+        if (typeof this.onRenameKey === 'function') {
+            try { this.onRenameKey(oldPathStr, newPathStr); } catch (e) { console.error('onRenameKey 回调出错', e); }
+        }
     }
 
     _getByPath(path) {

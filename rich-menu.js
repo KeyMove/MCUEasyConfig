@@ -227,6 +227,8 @@ class RichMenu {
     border-color: #818cf8; box-shadow: 0 0 0 3px rgba(129,140,248,0.15);
 }
 .rm-textarea { resize: vertical; min-height: 80px; }
+/* 紧凑单行文本域：用于「右键菜单 JSON」等需提高 UI 密度的场景（dense:true） */
+.rm-textarea.rm-dense { min-height: 0; height: 26px; resize: none; padding: 4px 8px; overflow: hidden; line-height: 18px; white-space: nowrap; }
 .rm-select { cursor: pointer; appearance: auto; }
 
 /* ===== Range ===== */
@@ -1009,7 +1011,7 @@ class RichMenu {
 
     _createTextarea(ctrl) {
         const ta = document.createElement('textarea');
-        ta.className = 'rm-textarea';
+        ta.className = 'rm-textarea' + (ctrl.dense ? ' rm-dense' : '');
         ta.id = ctrl.id;
         ta.name = ctrl.id;
         ta.value = ctrl.value ?? '';

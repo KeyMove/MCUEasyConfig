@@ -18,6 +18,7 @@ class PreviewWindow {
      */
     constructor(opts = {}) {
         this.excel = opts.excel || null;
+        this.dark = opts.dark !== undefined ? !!opts.dark : true;
         this.defs = [];
         this.instances = new Map(); // id -> { def, el, unbind, getVal, setVal }
         this.onValueChange = opts.onValueChange || null;
@@ -122,6 +123,10 @@ class PreviewWindow {
 .pw-ctl.pw-type-textarea > div:not(.pw-head) { flex:1; display:flex; min-height:0; }
 .pw-ctl.pw-type-textarea textarea { width:100%; height:100%; flex:1; box-sizing:border-box;
     resize:none; line-height:1.4; }
+/* 波形图控件：canvas 背景由 WaveChart 主题决定（透明，透出容器色）。
+   这里给控件块一个与窗口主题一致的底色，未绑数据时不刺眼。 */
+.pw-ctl.pw-type-chart { background:#0f172a; overflow:hidden; }
+.pw-ctl.pw-type-chart canvas { background:transparent; }
 `;
         document.head.appendChild(s);
     }
@@ -262,6 +267,71 @@ class PreviewWindow {
             }
             this.stage.appendChild(box);
             this.instances.set(def.id, { def, el: box, unbind, getVal, setVal });
+            return box;
+        }
+
+        // 波形图控件：用 WaveChart 渲染实时曲线。每个关联单元格是一个 series，
+        // 单元格值变化即 push 一个采样点，支持多通道、跟随最新、缩放/平移等交互。
+        if (type === 'chart') {
+            box.classList.remove('unbound');
+            let unbind = () => {};
+            // 图例/标题可隐藏（由显示选项控制）；波形占满控件块
+            const cells = (def.cell || '').split(',').map(c => c.trim().toUpperCase()).filter(Boolean);
+            const names = (def.series && Array.isArray(def.series)) ? def.series
+                : cells.map(c => c);
+            const canvas = document.createElement('canvas');
+            canvas.style.cssText = 'width:100%; height:100%; display:block;';
+            box.appendChild(canvas);
+            // 让 canvas 占满控件块（去掉标题会让波形更完整）
+            if (disp.name) {
+                const head = document.createElement('div');
+                head.className = 'pw-head';
+                head.innerHTML = `<span class="pw-lb">${this._esc(def.label || def.id)}</span>`;
+                box.insertBefore(head, canvas);
+                canvas.style.height = 'calc(100% - 22px)';
+            }
+            let chart = null;
+            try { chart = new WaveChart({ canvas, follow: !!def.follow, showPoints: def.showPoints || 200, theme: this.dark ? 'dark' : 'light' }); }
+            catch (e) { console.warn('[chart] 初始化失败', e); }
+
+            if (chart && cells.length) {
+                cells.forEach((c, i) => {
+                    chart.addSeries({ name: names[i] || c, color: undefined });
+                });
+                // 收集每个单元格的 unbind，清理时一并解除监听
+                const cellUnbinds = [];
+                cells.forEach((c) => {
+                    if (this.excel && this.excel.hasCell(c)) {
+                        const cur = this.excel.getCell(c);
+                        if (cur !== undefined && cur !== '' && !Number.isNaN(parseFloat(cur))) {
+                            // 用当前值预热一条数据
+                            chart.push(cells.map((cc) => {
+                                const v = this.excel.getCell(cc);
+                                return (v === undefined || v === '') ? NaN : parseFloat(v);
+                            }));
+                        }
+                        const ub = this.excel.bindCell(c, {
+                            get: () => this.excel.getCell(c),
+                            set: (v) => {
+                                // 把所有通道当前值组成一个采样点一起 push，保证各通道时间对齐
+                                chart.push(cells.map((cc) => {
+                                    const cv = this.excel.getCell(cc);
+                                    return (cv === undefined || cv === '') ? NaN : parseFloat(cv);
+                                }));
+                            },
+                        }, canvas);
+                        if (ub) cellUnbinds.push(ub);
+                    }
+                });
+                unbind = () => { cellUnbinds.forEach(fn => fn && fn()); if (chart) chart.destroy(); };
+            }
+            const getVal = () => (chart ? chart.series.map(s => s.data.slice(-1)[0]) : []);
+            const setVal = () => {}; // 波形为只读展示，不接受外部 setVal 覆盖
+            this.stage.appendChild(box);
+            // 兜底：等 DOM 完成布局（控件块拿到真实尺寸）后再 resize 一次位图，
+            // 避免「重新进入编辑」时 canvas 初始测到 0 尺寸，位图停留在 1x1 而变模糊。
+            if (chart) requestAnimationFrame(() => chart.resize());
+            this.instances.set(def.id, { def, el: box, unbind: unbind || (() => {}), getVal, setVal });
             return box;
         }
 

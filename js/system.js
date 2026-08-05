@@ -179,7 +179,22 @@ let nodeSystem = {
         // 应用当前的缩放和位置变换
         this.applyNodeTransform(node);
 
-        // 添加节点事件监听器
+        // 绑定节点全部事件（拖动 / 删除 / Pad / 自定义器件右键菜单 / MCU 寄存器编辑）
+        this.bindNodeEvents(node, nodeId);
+
+        // 触发节点变化回调
+        this.triggerCallback('onNodeChange', { type: 'create', nodeId });
+
+        return nodeId;
+    },
+
+    /**
+     * 绑定一个节点的全部交互事件。
+     * createNode 与新节点创建、loadFromJSON 反序列化都调用本方法，
+     * 避免「加载 JSON 后丢失右键菜单（自定义器件操作 / MCU 寄存器编辑）」的问题。
+     */
+    bindNodeEvents(node, nodeId) {
+        // 添加节点拖动事件监听器
         node.element.addEventListener('mousedown', (e) => this.startNodeDrag(e));
         const deleteButton = node.element.querySelector('.delete-node');
         if (deleteButton) {
@@ -224,11 +239,6 @@ let nodeSystem = {
                 }
             }
         });
-
-        // 触发节点变化回调
-        this.triggerCallback('onNodeChange', { type: 'create', nodeId });
-
-        return nodeId;
     },
 
     /**
@@ -2957,7 +2967,13 @@ let nodeSystem = {
             nodeIdCounter: this.nodeIdCounter,
             lineConfig: { ...this.lineConfig },
             zoomLevel: this.zoomLevel,
-            panOffset: { ...this.panOffset }
+            panOffset: { ...this.panOffset },
+            // 保存当前画布的调试程序（ide.js 全局对象 __ideFiles）。无程序则留空数组。
+            ide: (typeof window.Ide !== 'undefined' && window.Ide && typeof window.Ide.getFiles === 'function')
+                ? window.Ide.getFiles() : [],
+            // 保存全部面板（全局 + 会话），每个带 global 标志；加载时按标志落回对应存储
+            panels: (typeof PanelWorkbench !== 'undefined' && PanelWorkbench.exportCanvasPanels)
+                ? PanelWorkbench.exportCanvasPanels() : []
         };
 
         // 序列化所有节点
@@ -3015,24 +3031,8 @@ let nodeSystem = {
                 // 应用变换
                 this.applyNodeTransform(node);
 
-                // 添加节点事件监听器
-                node.element.addEventListener('mousedown', (e) => this.startNodeDrag(e));
-                const deleteButton = node.element.querySelector('.delete-node');
-                if (deleteButton) {
-                    deleteButton.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        this.deleteNode(node.nodeId);
-                    });
-                }
-
-                // 添加pad事件监听器
-                const pads = node.element.querySelectorAll('.node-port');
-                pads.forEach(pad => {
-                    pad.addEventListener('mousedown', (e) => this.startConnection(e, pad));
-                    pad.addEventListener('contextmenu', (e) => this.openAF(e, pad));
-                    pad.addEventListener('mouseenter', (e) => this.highlightConnectedPads(e, pad));
-                    pad.addEventListener('mouseleave', (e) => this.removePadHighlight());
-                });
+                // 绑定节点全部交互事件（拖动 / 删除 / Pad / 自定义器件右键菜单 / MCU 寄存器编辑）
+                this.bindNodeEvents(node, node.nodeId);
             });
 
             // 恢复连接
@@ -3040,6 +3040,16 @@ let nodeSystem = {
             // 恢复连接后重新应用接口初始化
             this.loadInterfaceInits();
             this.recomputeInterfaceInitRegisters();
+
+            // 恢复画布的调试程序（ide.js 全局对象 __ideFiles）。无程序则留空。
+            if (jsonData.ide !== undefined && typeof window.Ide !== 'undefined' && window.Ide && typeof window.Ide.setFiles === 'function') {
+                window.Ide.setFiles(jsonData.ide || []);
+            }
+
+            // 恢复面板（按 global 标志分别写回 localStorage / 会话内存）
+            if (jsonData.panels !== undefined && typeof PanelWorkbench !== 'undefined' && typeof PanelWorkbench.importCanvasPanels === 'function') {
+                PanelWorkbench.importCanvasPanels(jsonData.panels || []);
+            }
 
             // 应用变换
             this.applyTransform();

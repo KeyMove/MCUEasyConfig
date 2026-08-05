@@ -13,96 +13,181 @@
              * @param {number} [columns=26] - 初始列数
              */
             constructor(container, rows = 20, columns = 26, options = {}) {
-                // 初始化容器
-                this.container = typeof container === 'string' 
-                    ? document.getElementById(container) 
-                    : container;
+                // headless：无头纯数据模式。此时不创建任何 DOM、不挂样式、不启定时器，
+                // 仅作为「数据引擎」使用（供 PanelRuntime 等菜单基础组件无 UI 调用）；
+                // 之后可调用 attachDOM() 再关联前端，实现「前端剥离 + 关联前端」双形态。
+                this.headless = !!options.headless;
+
+                // 初始化容器（无头模式允许 container 为空，不强制依赖 document）
+                this.container = container
+                    ? (typeof container === 'string' ? document.getElementById(container) : container)
+                    : null;
                 // dark: 暗色主题（与 MacWindow / 布局/成品窗口统一视觉）
                 this.dark = !!options.dark;
-                if (this.dark) this.container.classList.add('excel-dark');
-                
+                if (!this.headless && this.container && this.dark) this.container.classList.add('excel-dark');
+
                 // 表格行列配置
                 this.rows = rows;
                 this.columns = columns;
-                
+
                 // 选择状态相关属性
                 this.isSelecting = false;       // 是否正在选择
                 this.startCell = null;           // 选择起始单元格
                 this.endCell = null;             // 选择结束单元格
                 this.selectCell = null;          // 当前选中单元格
                 this.selectCellKey = null;
-                this.updatetype=0;
-                this.updatelevel=0;
-                // 创建选择矩形元素
-                this.selectionRect = document.createElement('div');
-                this.selectionRect.className = 'selection-rect';
-                
+                this.updatetype = 0;
+                this.updatelevel = 0;
+
                 // 空操作函数
                 this.action_null = () => 0;
-                
+
                 this.PromiseMode = false;
                 this.chain = null;
                 this.lastchain = null;
                 // 单元格数据缓存和依赖跟踪
-                this.cellData = {}; 
-                this.Data = {map:{},handle:this,update:(cell)=>this.callupdateCell(this.cellData[cell])};
+                this.cellData = {};
+                this.Data = { map: {}, handle: this, update: (cell) => this.callupdateCell(this.cellData[cell]) };
                 // 外部绑定桥接：cellKey -> { get, set, el } 外部控件（滑块/输入框等）与单元格双向同步
                 this.bindings = {};
-        
+
                 // 配置系统函数
                 this.systemIdentifier = {
-                    SUM: (arr)=>{let v=0;arr.forEach(x=>v+=x);return v;},
-                    AVG: function(...args) { return args.reduce((a,b) => a+b, 0)/args.length; }
+                    SUM: (arr) => { let v = 0; arr.forEach(x => v += x); return v; },
+                    AVG: function (...args) { return args.reduce((a, b) => a + b, 0) / args.length; }
                 };
-                this.actionCall={
-                    TIMER:(cell,t)=>this.bindKey(cell,`TIMER${t}`),
+                this.actionCall = {
+                    TIMER: (cell, t) => this.bindKey(cell, `TIMER${t}`),
+                };
+
+                // 内部 TIMER 单元格（公式可能依赖 $.TIMERx，无论是否无头都需建，但无头不挂定时器）
+                this.TimerMS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+                this.TimerDT = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                for (let i = 0; i < this.TimerMS.length; i++) {
+                    this.cellData[`TIMER${this.TimerMS[i]}`] = {
+                        key: `TIMER${this.TimerMS[i]}`,
+                        value: '',          // 单元格值
+                        formula: '',       // 公式
+                        updateaction: this.action_null, // 更新函数
+                        updatecell: new Set(), // 依赖此单元格的单元格
+                        reqcell: new Set(),    // 此单元格依赖的单元格
+                        input: { value: 0 },          // 无头时为虚拟对象；关联前端后替换为真实 input
+                        handle: this,
+                    };
                 }
-                
+
+                // 无头模式：到此结束，仅作为数据引擎，不碰任何 DOM。
+                if (this.headless) return;
+
+                // 选择矩形元素
+                this.selectionRect = document.createElement('div');
+                this.selectionRect.className = 'selection-rect';
+
                 // 确保样式只添加一次
                 if (!ExcelTable.stylesAdded) {
                     this.addStyles();
                     ExcelTable.stylesAdded = true;
                 }
-                
+
                 // 初始化表格
                 this.init();
                 // 选择框挂到可滚动容器里：该容器是 position:relative 且 overflow:auto 的定位上下文，
                 // 这样框既相对容器定位，又会被容器裁切，不会溢出盖到窗口标题栏。
                 (this.tableContainer || this.container).appendChild(this.selectionRect);
-        
-                this.TimerMS=[1,2,3,4,5,6,7,8,9,10];
-                this.TimerDT=[0,0,0,0,0,0,0,0,0,0];
-                setInterval(() => {
-                    for (let i = 0; i < this.TimerDT.length; i++) {
-                        this.TimerDT[i]--;
-                        if(this.TimerDT[i]<=0){
-                            this.TimerDT[i]=this.TimerMS[i];
-                            const cell=this.cellData[`TIMER${this.TimerMS[i]}`];
-                            if(cell.updatecell.size>0)
-                                this.callupdateCell(cell);
-                        }
-                    }
-                }, 100);
-        
-                for (let i = 0; i < this.TimerMS.length; i++) {
-                    // 初始化单元格数据
-                    this.cellData[`TIMER${this.TimerMS[i]}`] = {
-                                key: `TIMER${this.TimerMS[i]}`,
-                                value: '',          // 单元格值
-                                formula: '',       // 公式
-                                updateaction: this.action_null, // 更新函数
-                                updatecell: new Set(), // 依赖此单元格的单元格
-                                reqcell: new Set(),    // 此单元格依赖的单元格
-                                input: {value:0},          // 输入框引用
-                                handle:this,
-                    };
-                }
-                
+
+                // TIMER 定时器改为「懒启动」：只有某单元格真正 bindKey(TIMERx) 时才启动，
+                // 避免每个 ExcelTable 实例都常驻一个 100ms 空转定时器（大量面板实例时卡顿）。
+                this._timerId = null;
+            }
+
+            /**
+             * 将无头实例关联前端（在 headless 构造之后调用）。
+             * 复用现有 init() 建 DOM；建好的真实 input 会回填到 cellData[].input，
+             * 后续的 setCell/getCell 自动走真实 DOM 镜像，实现「数据引擎 → 关联前端」。
+             * @param {string|HTMLElement} container 前端容器
+             * @param {Object} [opts] { dark, rows, columns }
+             */
+            attachDOM(container, opts = {}) {
+                if (!this.headless) return this; // 本就非无头，无需再挂
+                this.headless = false;
+                this.container = typeof container === 'string' ? document.getElementById(container) : container;
+                if (opts.dark) this.dark = true;
+                if (this.dark && this.container) this.container.classList.add('excel-dark');
+
+                // 样式 + 选择框 + DOM 结构
+                if (!ExcelTable.stylesAdded) { this.addStyles(); ExcelTable.stylesAdded = true; }
+                this.selectionRect = document.createElement('div');
+                this.selectionRect.className = 'selection-rect';
+                this.init();
+                (this.tableContainer || this.container).appendChild(this.selectionRect);
+
+                // TIMER 定时器保持懒启动（见 _startTimer）：无头期若已因 bindKey(TIMER) 启动则沿用，
+                // 否则首次绑定 TIMER 单元时才启。此处仅初始化计时器句柄。
+                this._timerId = null;
+                return this;
             }
             bindKey(cell,key){
                 const e=this.cellData[key];
                 cell.reqcell.add(e);
                 e.updatecell.add(cell);
+                // 首次绑定到某个 TIMER 单元时，懒启动该实例的定时器（避免空转浪费）
+                if (key && key.startsWith('TIMER')) this._startTimer();
+            }
+
+            /**
+             * 懒启动 TIMER 定时器：仅当首个单元格 bindKey(TIMERx) 时才跑，
+             * 避免每个 ExcelTable 实例都常驻一个 100ms 空转定时器（大量面板实例时卡顿）。
+             * 无头实例同样支持：单元格里的 $.TIMERx 定时执行仍需要定时器驱动，
+             * 但「绑定触发」保证只有真正用到 TIMER 的无头实例才会起定时器，
+             * 纯数据引擎（未绑 TIMER）依旧零开销。定时器本身不碰 DOM，无头安全。
+             * 幂等：已启动则直接返回。
+             */
+            _startTimer() {
+                if (this._timerId != null) return;
+                if (typeof setInterval !== 'function') return;
+                this._timerId = setInterval(() => {
+                    for (let i = 0; i < this.TimerDT.length; i++) {
+                        this.TimerDT[i]--;
+                        if (this.TimerDT[i] <= 0) {
+                            this.TimerDT[i] = this.TimerMS[i];
+                            const cell = this.cellData[`TIMER${this.TimerMS[i]}`];
+                            if (cell.updatecell.size > 0) this.callupdateCell(cell);
+                        }
+                    }
+                    // 自回收：若所有 TIMER 单元都已无单元格引用，则关闭定时器，
+                    // 避免绑定过 TIMER 但后来引用全部解除的实例继续空转。
+                    // 下次再有单元格 bindKey(TIMER) 会重新 _startTimer（幂等）。
+                    let used = false;
+                    for (let i = 0; i < this.TimerMS.length; i++) {
+                        if (this.cellData[`TIMER${this.TimerMS[i]}`].updatecell.size > 0) { used = true; break; }
+                    }
+                    if (!used) this._stopTimer();
+                }, 100);
+            }
+
+            /**
+             * 停止并清理 TIMER 定时器（实例销毁时调用，防止定时器泄漏累积）。
+             */
+            _stopTimer() {
+                if (this._timerId != null && typeof clearInterval === 'function') {
+                    clearInterval(this._timerId);
+                }
+                this._timerId = null;
+            }
+
+            /**
+             * 销毁实例：停止定时器并解除绑定，释放对 DOM/外部控件的引用。
+             * 无头实例也可调用（仅清理内存，无 DOM 可移除）。
+             */
+            destroy() {
+                this._stopTimer();
+                if (this.bindings) this.bindings = {};
+                if (this.cellData) {
+                    Object.values(this.cellData).forEach(c => {
+                        if (c) { c.updatecell = new Set(); c.reqcell = new Set(); }
+                    });
+                }
+                return this;
             }
             
             /**
@@ -361,17 +446,24 @@
                         input.col = td.col = String.fromCharCode(65 + j);
                         const cellKey = `${td.col}${td.row}`;
                         
-                        // 初始化单元格数据
-                        this.cellData[cellKey] = {
-                            key: cellKey,
-                            value: '',          // 单元格值
-                            formula: '',       // 公式
-                            updateaction: this.action_null, // 更新函数
-                            updatecell: new Set(), // 依赖此单元格的单元格
-                            reqcell: new Set(),    // 此单元格依赖的单元格
-                            input: input,          // 输入框引用
-                            handle:this,
-                        };
+                        // 若无头期已惰性创建过该单元格（value/formula/依赖图已存在），
+                        // 则复用原对象、仅把 input 引用替换为真实元素，避免覆盖已写入的数据。
+                        let cell = this.cellData[cellKey];
+                        if (!cell) {
+                            cell = {
+                                key: cellKey,
+                                value: '',
+                                formula: '',
+                                updateaction: this.action_null,
+                                updatecell: new Set(),
+                                reqcell: new Set(),
+                                input: input,
+                                handle: this,
+                            };
+                            this.cellData[cellKey] = cell;
+                        } else {
+                            cell.input = input; // 仅替换镜像，保留 value/formula/依赖
+                        }
         
                         // 为Data对象定义属性，方便公式计算
                         Object.defineProperty(this.Data, cellKey, {
@@ -392,11 +484,11 @@
         
                         // 输入框获取焦点事件
                         input.addEventListener('focus', () => {
-                            let cell=this.cellData[cellKey];
-                            this.selectCell = cell;
+                            let c=this.cellData[cellKey];
+                            this.selectCell = c;
                             this.selectCellKey = cellKey;
-                            cell.reqcell.forEach(e => e.updatecell.delete(cell));
-                            cell.reqcell.clear();
+                            c.reqcell.forEach(e => e.updatecell.delete(c));
+                            c.reqcell.clear();
                             if (this.cellData[cellKey].formula) {
                                 input.value = '=' + this.cellData[cellKey].formula;
                             } else {
@@ -575,15 +667,52 @@
         
             // ==================== 对外访问 API（供自定义面板使用） ====================
 
+            /**
+             * 惰性创建业务单元格（无头模式下不会预建 A1..，访问时按需创建虚拟单元格）。
+             * 仅对合法单元引用格式（如 A1）生效；已存在则直接返回。
+             * @returns {Object|null} 单元格对象，或非法 key 时 null
+             */
+            ensureCell(cellKey) {
+                if (this.cellData[cellKey]) return this.cellData[cellKey];
+                if (!this.isCellReference(cellKey)) return null;
+                const cell = {
+                    key: cellKey,
+                    value: '',
+                    formula: '',
+                    updateaction: this.action_null,
+                    updatecell: new Set(),
+                    reqcell: new Set(),
+                    input: { value: 0 }, // 无头：虚拟镜像；关联前端后由 addRows 替换为真实 input
+                    handle: this,
+                };
+                this.cellData[cellKey] = cell;
+                // 为公式引擎暴露 $.A1 访问器（无头模式没有 addRows 来定义，这里补齐）
+                if (!(cellKey in this.Data)) {
+                    Object.defineProperty(this.Data, cellKey, {
+                        get: () => this.cellData[cellKey].value,
+                        set: (v) => {
+                            this.updatetype = 1;
+                            v = v.toString();
+                            if (v.startsWith('=')) {
+                                this.setCellFormula(this.cellData[cellKey], v.substring(1));
+                            } else {
+                                this.setCellValue(this.cellData[cellKey], v);
+                            }
+                        }
+                    });
+                }
+                return cell;
+            }
+
             /** 读取单元格当前值（无论普通值还是公式结果） */
             getCell(cellKey) {
-                const c = this.cellData[cellKey];
+                const c = this.ensureCell(cellKey);
                 return c ? c.value : undefined;
             }
 
             /** 写入单元格：普通值或公式（以 = 开头）。会触发依赖重算。 */
             setCell(cellKey, value) {
-                const c = this.cellData[cellKey];
+                const c = this.ensureCell(cellKey);
                 if (!c) return;
                 if (typeof value === 'string' && value.startsWith('=')) {
                     this.setCellFormula(c, value.substring(1));
@@ -592,7 +721,7 @@
                 }
             }
 
-            /** 单元格是否存在 */
+            /** 单元格是否存在（不触发惰性创建；无头期尚未访问过的业务单元返回 false） */
             hasCell(cellKey) { return !!this.cellData[cellKey]; }
 
             /**
@@ -621,7 +750,7 @@
              * @param {string} [formula] 若提供，记为公式单元格（但暂不计算）
              */
             setCellRaw(cellKey, value, formula) {
-                const cell = this.cellData[cellKey];
+                const cell = this.ensureCell(cellKey);
                 if (!cell) return this;
                 if (formula !== undefined && formula !== null && formula !== '') {
                     cell.formula = formula;
@@ -651,11 +780,15 @@
                 return this;
             }
 
-            /** 导出当前所有单元格的 {value, formula} 快照，用于持久化 */
+            /** 导出当前单元格的 {value, formula} 快照，用于持久化 */
             dumpCellData() {
                 const out = {};
                 Object.values(this.cellData).forEach(c => {
                     if (!c.key || c.key.startsWith('TIMER')) return; // 跳过内部 TIMER 单元格
+                    // 只导出「有数据」的单元格：有公式、或值非空（非 '' / null / undefined）
+                    const hasVal = c.value !== '' && c.value !== null && c.value !== undefined;
+                    const hasFormula = !!(c.formula && c.formula.trim());
+                    if (!hasVal && !hasFormula) return;
                     out[c.key] = { value: c.value, formula: c.formula || '' };
                 });
                 return out;

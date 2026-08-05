@@ -1,4 +1,4 @@
-# [MCUEasyConfig（四向 Pad 节点连线系统 · MCU 引脚 / 寄存器可视化配置工具）](https://keymove.github.io/MCUEasyConfig/)
+# MCUEasyConfig（四向 Pad 节点连线系统 · MCU 引脚 / 寄存器可视化配置工具）
 
 > 项目代号 **MCUEasyConfig**：一个纯前端的 MCU 引脚连线与寄存器配置可视化工具。在画布上拖出 MCU、自定义器件、外设，
 > 通过「四向 Pad」连线表达引脚连接关系，系统会**自动完成 AF 复用、GPIO 模式、上下拉、接口初始化代码生成**，
@@ -29,6 +29,11 @@
   器件可存入收藏夹、直接放置；右键自定义器件弹出 JSON 定义的操作菜单（滑块 / 按钮 → 实时写 SVD 寄存器）。
 - **GPIO 输入变体**：自定义器件输入脚可声明 `GPIO_INPU`（输入+上拉）/ `GPIO_INPD`（输入+下拉），连接 MCU 时两端自动配置输入模式 + 对应上下拉。
 - **寄存器变动值导出**：一键输出所有「与复位值不同」的 GPIO / SVD 寄存器（`0x地址,0x值,//寄存器名`），按地址升序，可直接贴进固件初始化。
+- **可视化面板系统**：内置「面板工作台」（`PanelWorkbench`）——四窗口工作流（控件定义 / 表格 / 布局 / 成品预览）拖拽设计交互面板，
+  可保存为「全局 / 会话」面板，并运行成独立实例（`PanelRuntime`，自带数据总线 + 成品窗口，多开互不干扰）。
+  - 面板管理菜单可：创建 / 保存 / 运行当前设计 / 运行·复制 JSON·编辑·删除已有面板。
+  - 自定义器件节点的「右键菜单 JSON」同时支持两种格式：① 原 ops JSON（滑块/按钮直写 SVD 寄存器）；
+    ② 面板导出 JSON（右键直接弹出该面板，**按节点单例**：同一节点反复右键只提到前台，不重复创建）。
 - **配置管理**：IO 功能库（config）导入 / 导出 / 应用 / 重置，持久化到浏览器 localStorage。
 
 ### 通信调试模块（comm.js）
@@ -84,7 +89,13 @@ npx serve .
 ├── rich-menu.js / dock.js / macwindow.js   顶栏 Dock / 菜单 / macOS 风格窗口
 ├── svd2js.js               SVD + SFD → JS 转换器（见下）
 ├── excel.js                表格 / 数据导入导出辅助
+├── chart.js                波形 / 图表控件（面板运行时图表类控件依赖）
 ├── tools/                  配置 / 库生成与校验脚本
+│   ├── panel-workbench.js    可视化面板工作台（四窗口设计 + 面板管理菜单 + 导出快照）
+│   ├── panel-runtime.js      面板运行实例（独立数据总线 + 成品窗口，多开/单例/序号回收）
+│   ├── preview-window.js     成品窗口（MacWindow 外壳 + 控件渲染，编辑态与运行态共用）
+│   ├── layout-window.js      布局窗口（拖拽摆放控件）
+│   ├── gen-config-js.js       硬件库源(config.full.json) → js/config.js
 │   ├── gen-config-js.js       硬件库源(config.full.json) → js/config.js
 │   ├── gen-config-bundle.js   config.json → config.bundle.js
 │   ├── check-config.js        校验配置合法性
@@ -146,6 +157,16 @@ npx serve .
 - IO 功能库持久化在浏览器 localStorage；`config.json` 仅作导入 / 导出介质（导入即叠加到基础库）。
 - 重置恢复默认（硬件库始终来自 `js/config.js`）。
 
+### 7. 可视化面板系统（panel-workbench.js / panel-runtime.js）
+
+- **设计面板**：Dock 进入「面板」管理菜单 → 创建 / 保存（`全局` 刷新不消失；`会话` 随画布 JSON 导出/加载），
+  四窗口实时联动：控件定义（RichObjectEditor）经「➡️」推送到布局窗口，布局驱动成品窗口即时预览，控件值经表格双向绑定。
+- **运行面板**：点「运行当前设计」或列表项 `▶` → `PanelRuntime` 构造独立运行实例（多开并存，各自隔离）。
+  - 多开序号类 Windows 重命名：仅重复时追加 `#2`/`#3`，关掉后序号回收；窗口按序号错位避免重叠。
+  - 运行按钮文案为「运行独立实例」——本系统无编译过程，仅按快照构造运行态。
+- **右键单例**：自定义器件节点右键，若 `deviceMenu` 为面板导出 JSON，则弹出**按节点单例**的面板（同节点反复右键仅提到前台）。
+- 面板管理菜单 `z-index: 100000`，始终浮于运行实例窗口之上。
+
 ---
 
 ## 🛠 工具脚本（tools/）
@@ -180,6 +201,25 @@ window.MCU_REG_DB["CIU32F003x5"] = {
 ```
 
 示例：`W25Q16 SOP 通用SPI 通用SPI2` ；引脚 `SCK SPI SCK` / `PB0 GPIO_OUT` / `PC0/NRST` / `AIN3 ADC_IN3`。
+
+### 面板导出 JSON（PanelWorkbench.exportProject 快照）
+
+可作为自定义器件节点「右键菜单 JSON」直接弹出面板。判定条件：对象含 `layout` 且含 `cells`/`data`/`schema`/`_meta` 任一键（且非 `ops`/数组）。
+
+```js
+{
+  _name: "温控面板",          // 面板名（运行时作窗口标题）
+  _meta: { /* 元信息 */ },
+  data:  { /* 表格数据 */ },
+  schema:{ /* 控件定义 schema */ },
+  layout:[ /* 布局：控件位置/尺寸/类型 */ ],
+  cells: { /* 单元格值（可含 JS 公式） */ },
+  preview:{ w, h }           // 成品窗口尺寸（用户拖拽后保留）
+}
+```
+
+> 另一种右键菜单 JSON 为「ops 格式」：`{ "ops": [ {type:"slider", register:"TIMx.CCRn", ...} ] }` 或裸数组，
+> 走原逻辑（滑块/按钮直写 SVD 寄存器），详见 `js/main.js` 的 `openCustomDeviceMenu`。
 
 ---
 

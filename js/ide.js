@@ -19,6 +19,14 @@ let __ideMenu = null;
 let __ideFiles = [];          // [{ id, name, code }]
 let __ideActiveId = null;
 let __ideFileSeq = 1;
+// 刷新请求队列：外部（如画布加载 JSON 后调用 setFiles）可能在 IDE 窗口尚未创建 /
+// 组件尚未加载完成时请求更新 code 区。此时把刷新标记为「待处理」，待 IDE 真正
+// 打开并完成组件加载后再消费一次，避免「数据已写入但 code 区空白」。
+let __ideRefreshPending = false;
+// 待加载的文件数据（画布加载 JSON 时通过 setFiles 写入），等 IDE 就绪后再按标准流程填入。
+let __idePendingFiles = null;
+// 每个文件各自的滚动位置（切换文件后回到上次位置）：id -> { top, left }
+const __ideScrollPos = new Map();
 // 已关联的本地文件夹：非空表示打开了用户文件夹，编译时无缝写回（仅可写 handle 时）。
 // __ideDirHandle: FileSystemDirectoryHandle（可写）| null；__ideDirReadOnly: 回退只读模式标记。
 let __ideDirHandle = null;
@@ -266,16 +274,18 @@ pre.ide-editor{color:#e6ebf2;z-index:1;pointer-events:none;}
     __ideWin = win;
     __ideMenu = menu;
 
-    // 首次打开：懒加载 cc 编译器（带加载动画），完成后再填充默认示例文件。
+    // 首次打开：懒加载 cc 编译器（带加载动画），完成后再填充 / 刷新 code 区。
     // 若已加载过（脚本已注入全局），直接填充，无需动画。
+    // 组件加载完成后统一调用 flushIdeRefresh()：消费「画布加载 JSON 时已排队的刷新请求」，
+    // 保证外部注入的代码能正确渲染进侧边文件栏与编辑框。
     if (!window.C4Reg || !window.C4Thumb) {
         __ideEnsureCompiler().then(() => {
             if (__ideFiles.length === 0) addIdeFile('main.c', DEFAULT_IDE_SRC, true);
-            else { renderIdeFileList(); selectIdeFile(__ideActiveId); }
+            flushIdeRefresh();
         });
     } else {
         if (__ideFiles.length === 0) addIdeFile('main.c', DEFAULT_IDE_SRC, true);
-        else { renderIdeFileList(); selectIdeFile(__ideActiveId); }
+        flushIdeRefresh();
     }
 }
 
@@ -302,8 +312,9 @@ function buildIdeCodePanel(panel) {
     const bEdit = document.createElement('button'); bEdit.textContent = '✎'; bEdit.title = '重命名当前文件';
     const bDel = document.createElement('button'); bDel.textContent = '🗑'; bDel.title = '删除当前文件';
     bNew.onclick = () => {
-        // 新建：直接在文件列表里插入可编辑的文件名（行内编辑态）
-        const f = { id: __ideFileSeq++, name: 'untitled.c', code: '' };
+        // 新建：直接在文件列表里插入可编辑的文件名（行内编辑态）。
+        // 默认名按 Windows 风格避免与现有文件重名（如 untitled (2).c）。
+        const f = { id: __ideFileSeq++, name: uniqueIdeName('untitled.c'), code: '' };
         __ideFiles.push(f);
         renderIdeFileList();
         selectIdeFile(f.id);
@@ -605,6 +616,19 @@ function ideConfirmInList(title, message, okLabel, cancelLabel) {
 }
 
 // ====== 文件管理 ======
+// 生成不与现有文件冲突的唯一名（Windows 风格：重名时在扩展名前加「 (2)」「 (3)」…）。
+// excludeId 用于重命名时排除自身。
+function uniqueIdeName(name, excludeId) {
+    const names = new Set(__ideFiles.filter(f => f.id !== excludeId).map(f => f.name));
+    if (!names.has(name)) return name;
+    const dot = name.lastIndexOf('.');
+    const base = (dot > 0) ? name.slice(0, dot) : name;
+    const ext = (dot > 0) ? name.slice(dot) : '';
+    let n = 2;
+    while (names.has(base + ' (' + n + ')' + ext)) n++;
+    return base + ' (' + n + ')' + ext;
+}
+
 function addIdeFile(name, code, active) {
     const f = { id: __ideFileSeq++, name, code };
     __ideFiles.push(f);
@@ -667,9 +691,11 @@ function startRename(f, isNew) {
         const v = input.value.trim();
         if (!v) { // 空名：新建则删除，重命名则还原
             if (isNew) { deleteIdeFile(f.id); return; }
-        } else {
-            f.name = v;
+            renderIdeFileList();
+            return;
         }
+        // 重名时按 Windows 风格在扩展名前加 (n)，避免覆盖/重复。
+        f.name = uniqueIdeName(v, f.id);
         renderIdeFileList();
         if (__ideActiveId === f.id) selectIdeFile(f.id);
     };
@@ -699,18 +725,91 @@ function deleteIdeFile(id) {
     }
 }
 
-function selectIdeFile(id) {
+function selectIdeFile(id, skipSave) {
     const ta = document.getElementById('ideInput');
     const pre = document.getElementById('ideHighlight');
-    // 先保存当前编辑框内容到「旧」文件（此时 __ideActiveId 还是旧 id）
-    saveIdeCurrent();
+    const gutter = document.getElementById('ideGutter');
+    // 离开旧文件前：保存旧文件滚动位置 + 编辑框内容（此时 __ideActiveId 还是旧 id）
+    if (__ideActiveId != null && ta) {
+        __ideScrollPos.set(__ideActiveId, { top: ta.scrollTop, left: ta.scrollLeft });
+    }
+    // 保存当前编辑框内容到「旧」文件。
+    // skipSave=true 时（外部注入代码，如画布加载 JSON）不回写，避免用旧编辑框内容覆盖新数据。
+    if (!skipSave) saveIdeCurrent();
     __ideActiveId = id;
     const f = __ideFiles.find(x => x.id === id);
     if (f && ta) {
         ta.value = f.code;
         syncIdeEditor();
+        // 进入新文件：恢复该文件上次滚动位置
+        const pos = __ideScrollPos.get(id);
+        const top = pos ? pos.top : 0;
+        const left = pos ? pos.left : 0;
+        ta.scrollTop = top; ta.scrollLeft = left;
+        if (pre) { pre.scrollTop = top; pre.scrollLeft = left; }
+        if (gutter) gutter.scrollTop = top;
     }
     renderIdeFileList();
+}
+
+/**
+ * 把保存的文件按「用户手动新建文件」的完全一致流程填入 code 区：
+ * 清空现有列表 → 逐个 addIdeFile（即 push + renderIdeFileList + selectIdeFile 选中），
+ * 文件名直接使用保存名（不再进入行内重命名）。这样无论加载几个文件，
+ * 选中态都由标准流程统一维护，不会出现「同时选中多个」的残留 bug。
+ * 空数组表示「无程序」，仅清空不填默认示例。
+ */
+function applyLoadedFiles(files) {
+    const arr = Array.isArray(files) ? files : [];
+    __ideFiles = [];
+    __ideActiveId = null;
+    __ideScrollPos.clear();
+    if (arr.length === 0) {
+        renderIdeFileList();
+        return;
+    }
+    arr.forEach((f, i) => {
+        // 走与手动新建完全相同的 addIdeFile 流程；首个设为激活文件。
+        addIdeFile(f.name || ('file' + (i + 1) + '.c'), f.code || '', i === 0);
+    });
+}
+
+/**
+ * 请求刷新 code 区（侧边文件栏 + 编辑框）。
+ * 若 IDE 窗口/组件已就绪 → 立即将待加载文件按标准流程填入；
+ * 否则标记为待处理，等 initIde 加载完组件后消费。
+ */
+function requestIdeRefresh() {
+    if (__ideWin && document.body.contains(__ideWin.windowElement) && document.getElementById('ideInput')) {
+        if (__idePendingFiles != null) {
+            applyLoadedFiles(__idePendingFiles);
+            __idePendingFiles = null;
+        } else {
+            renderIdeFileList();
+            if (__ideActiveId != null) selectIdeFile(__ideActiveId, true);
+        }
+    } else {
+        __ideRefreshPending = true;
+    }
+}
+
+/**
+ * 消费待处理的刷新请求（由 initIde 在组件加载完成后调用一次）。
+ */
+function flushIdeRefresh() {
+    if (!__ideRefreshPending) return;
+    __ideRefreshPending = false;
+    if (__idePendingFiles != null) {
+        // 加载场景：按标准新建流程填入保存的文件（空则留空，不填默认）。
+        applyLoadedFiles(__idePendingFiles);
+        __idePendingFiles = null;
+    } else if (__ideFiles.length === 0) {
+        // 非加载场景且确实为空：填默认示例。
+        addIdeFile('main.c', DEFAULT_IDE_SRC, true);
+    } else {
+        renderIdeFileList();
+        if (__ideActiveId != null) selectIdeFile(__ideActiveId, true);
+    }
 }
 
 function saveIdeCurrent() {
@@ -1190,3 +1289,19 @@ int main(){
     return x + y;
 }
 `;
+
+// ====== 对外 API：供画布「保存 / 加载 JSON」读写全部代码 ======
+// getFiles：返回所有文件副本 [{ id, name, code }]（调用前先 flush 当前编辑内容）。
+// setFiles：用保存的代码覆盖文件列表（无代码则留空）。
+window.Ide = {
+    getFiles() {
+        try { saveIdeCurrent(); } catch (e) { /* 尚未初始化 IDE 窗口时忽略 */ }
+        return (__ideFiles || []).map(f => ({ id: f.id, name: f.name, code: f.code }));
+    },
+    setFiles(files) {
+        // 仅暂存数据并请求刷新；真正填入走 applyLoadedFiles（与手动新建一致的标准流程），
+        // 由 requestIdeRefresh / flushIdeRefresh 在 IDE 就绪后执行，避免直接替换数组导致的渲染残留。
+        __idePendingFiles = Array.isArray(files) ? files : [];
+        requestIdeRefresh();
+    }
+};
