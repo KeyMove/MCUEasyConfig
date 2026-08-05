@@ -709,14 +709,12 @@ class PanelWorkbench {
         return existed ? { ok: true, msg: `已删除面板「${name}」` } : { ok: false, msg: `面板「${name}」不存在` };
     }
 
-    /** 导出所有面板给「画布 JSON」：返回带 global 标志的数组（全局 + 会话合并，会话优先） */
+    /** 导出面板给「画布 JSON」：只导出【会话】面板（global=false），不导出全局面板。
+     * 全局面板存于 localStorage、刷新不消失，不应随画布 JSON 一起导出。 */
     static exportCanvasPanels() {
-        let ls = {};
-        try { ls = JSON.parse(localStorage.getItem(PanelWorkbench.PANEL_KEY) || '{}'); } catch (e) { ls = {}; }
-        const merged = Object.assign({}, ls, PanelWorkbench._sessionPanels);
-        return Object.values(merged).map(p => {
+        return Object.values(PanelWorkbench._sessionPanels).map(p => {
             const c = JSON.parse(JSON.stringify(p));   // 深拷贝，避免外部改动污染
-            if (typeof c.global !== 'boolean') c.global = !!(ls[c._name]);  // 兜底：来源全局即标 true
+            c.global = false;                          // 会话面板标记
             return c;
         });
     }

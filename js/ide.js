@@ -1295,6 +1295,12 @@ int main(){
 // setFiles：用保存的代码覆盖文件列表（无代码则留空）。
 window.Ide = {
     getFiles() {
+        // 若 IDE 窗口尚未打开、加载进来的文件还暂存在 __idePendingFiles 中
+        // （setFiles 只暂存、未 materialize 到 __ideFiles），直接回退用暂存数据，
+        // 否则会丢掉刚加载的 code（表现为「加载含 code 的 JSON 再保存，code 丢失」）。
+        if ((!__ideFiles || __ideFiles.length === 0) && __idePendingFiles && __idePendingFiles.length > 0) {
+            return __idePendingFiles.map(f => ({ id: f.id, name: f.name, code: f.code }));
+        }
         try { saveIdeCurrent(); } catch (e) { /* 尚未初始化 IDE 窗口时忽略 */ }
         return (__ideFiles || []).map(f => ({ id: f.id, name: f.name, code: f.code }));
     },
