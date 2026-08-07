@@ -996,7 +996,8 @@ let nodeSystem = {
             { reg: 'MODE',  name: 'MODER',  off: '0x00' },
             { reg: 'OTYPE', name: 'OTYPER', off: '0x04' },
             { reg: 'PUPD',  name: 'PUPDR',  off: '0x0C' },
-            { reg: 'AFL',   name: 'AFRL',   off: '0x20' }
+            { reg: 'AFL',   name: 'AFRL',   off: '0x20' },
+            { reg: 'AFH',   name: 'AFRH',   off: '0x24' }
         ];
         const hx = (v) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
         const entries = []; // { addr, text }
@@ -1005,7 +1006,9 @@ let nodeSystem = {
             if (!node.config || !node.config.device) return;
             const gpio = node.config.device.gpio;
             if (!gpio || !gpio.base || !gpio.regs || !gpio.reset) return;
-            for (const letter of ['A', 'B', 'C']) {
+            // 遍历该设备实际声明的所有 GPIO 端口（A~F 等），而非固定 A/B/C，
+            // 以支持含 GPIOF 等更多端口的芯片。
+            for (const letter of Object.keys(gpio.base)) {
                 const base = gpio.base[letter];
                 if (base == null) continue;
                 const regs = node.getPortRegisterValues(letter);
@@ -2499,8 +2502,11 @@ let nodeSystem = {
 
         let cp1x, cp1y, cp2x, cp2y;
 
-        // 根据源Pad方向调整第一个控制点
-        switch (connection.source.port) {
+        // 根据源Pad方向调整第一个控制点（考虑节点旋转后的实际朝向）
+        const srcDir = sourceNode.getEffectivePortDir
+            ? sourceNode.getEffectivePortDir(connection.source.port)
+            : connection.source.port;
+        switch (srcDir) {
             case 'top':
                 cp1x = sourcePos.x;
                 cp1y = sourcePos.y - offset;
@@ -2519,8 +2525,11 @@ let nodeSystem = {
                 break;
         }
 
-        // 根据目标Pad方向调整第二个控制点
-        switch (connection.target.port) {
+        // 根据目标Pad方向调整第二个控制点（考虑节点旋转后的实际朝向）
+        const tgtDir = targetNode.getEffectivePortDir
+            ? targetNode.getEffectivePortDir(connection.target.port)
+            : connection.target.port;
+        switch (tgtDir) {
             case 'top':
                 cp2x = targetPos.x;
                 cp2y = targetPos.y - offset;
@@ -2613,8 +2622,11 @@ let nodeSystem = {
 
         let cp1x, cp1y;
 
-        // 根据源Pad方向调整控制点
-        switch (this.connectionSource.port) {
+        // 根据源Pad方向调整控制点（考虑节点旋转后的实际朝向）
+        const dragDir = sourceNode.getEffectivePortDir
+            ? sourceNode.getEffectivePortDir(this.connectionSource.port)
+            : this.connectionSource.port;
+        switch (dragDir) {
             case 'top':
                 cp1x = sourcePos.x;
                 cp1y = sourcePos.y - offset;
@@ -2818,9 +2830,9 @@ let nodeSystem = {
     },
 
     /**
-     * 生成一个 IC 封装节点（SOP / LQFP / QFN）
-     * @param {string} type   封装类型：'SOP' | 'LQFP' | 'QFN'
-     * @param {number} perSide 每边引脚数
+     * 生成一个 IC 封装节点（SOP / LQFP / QFN / SIP）
+     * @param {string} type   封装类型：'SOP' | 'LQFP' | 'QFN' | 'SIP'
+     * @param {number} perSide 每边引脚数（SIP 即单列引脚总数）
      * @param {number} [x] 放置坐标
      * @param {number} [y]
      * @returns {string} nodeId
@@ -2835,11 +2847,16 @@ let nodeSystem = {
     },
 
     /**
-     * 生成一个预制设备节点（如 CIU32F003，含 PORT->AF0..AF7 复用表）
+     * 生成一个预制设备节点（如 CIU32F003，含 PORT->AF0..AF15 复用表，pin0~7→AFL，pin8~15→AFH）
      * @param {string} deviceName  APP_CONFIG.devices 的键名
      * @returns {string|null} nodeId
      */
     addDevice(deviceName) {
+        const dev = (window.APP_CONFIG && window.APP_CONFIG.devices || {})[deviceName];
+        // 自定义 MCU 设备以 packages 数组保存（可能多个封装），一次生成全部封装节点
+        if (dev && Array.isArray(dev.packages) && dev.packages.length) {
+            return this.addCustomDeviceSet(dev);
+        }
         const config = buildDevice(deviceName);
         if (!config) {
             console.warn('未知预制设备:', deviceName);
@@ -3093,10 +3110,22 @@ let nodeSystem = {
 
         // Delete / Backspace 键：删除选中的节点（输入框聚焦时不触发，避免误删正在输入的内容）
         document.addEventListener('keydown', (e) => {
-            if (e.key !== 'Delete' && e.key !== 'Backspace') return;
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
             if (this.selectedNodes.size === 0) return;
+
+            // R 键：选中器件顺时针旋转 90°，方便布局（连接端点随节点一起旋转）
+            if (e.key === 'r' || e.key === 'R') {
+                e.preventDefault();
+                this.selectedNodes.forEach(nodeId => {
+                    const n = this.nodes.get(nodeId);
+                    if (n) n.setRotation((n.rotation || 0) + 90);
+                });
+                this.drawAll(); // 旋转后同步更新连线端点
+                return;
+            }
+
+            if (e.key !== 'Delete' && e.key !== 'Backspace') return;
             e.preventDefault();
             this.deleteSelectedNodes();
         });
@@ -3255,7 +3284,8 @@ let nodeSystem = {
             const scaledY = node.position.y * this.zoomLevel + this.panOffset.y;
             node.element.style.left = `${scaledX}px`;
             node.element.style.top = `${scaledY}px`;
-            node.element.style.transform = `scale(${this.zoomLevel})`;
+            const rot = node.rotation ? ` rotate(${node.rotation}deg)` : '';
+            node.element.style.transform = `scale(${this.zoomLevel})${rot}`;
         }
     },
 

@@ -17,6 +17,7 @@ class Node {
         this.element = null;
         this.pads = new Map(); // 存储pad元素  key: `${side}-${index}`
         this.disabledPads = new Set(); // 存储禁用的pad
+        this.rotation = 0; // 旋转角度（度），R 键 90° 步进，便于布局；连接端点随节点一起旋转
 
         // 封装相关状态
         this.isChip = !!config.chip;
@@ -145,7 +146,7 @@ class Node {
         }
 
         pad.title = labelText;
-        pad.innerHTML = labelText;
+        pad.innerHTML = '<span class="pin-label">' + labelText + '</span>';
         this._fitPinFont(pad, labelText);
 
         // 均匀分布
@@ -172,10 +173,19 @@ class Node {
         return pad;
     }
 
+    // 返回某侧端口在"当前旋转"下的实际屏幕朝向（top/right/bottom/left）。
+    // 用于连线控制点方向计算，确保整体旋转后连线仍从引脚正确的外侧引出。
+    getEffectivePortDir(side) {
+        const order = ['top', 'right', 'bottom', 'left'];
+        const idx = order.indexOf(side);
+        if (idx < 0) return side;
+        const steps = Math.round(((this.rotation || 0) % 360) / 90);
+        return order[(idx + ((steps % 4) + 4) % 4) % 4];
+    }
+
     getPortPosition(side, index) {
         if (!this.element) return null;
 
-        const rect = this.element.getBoundingClientRect();
         const containerRect = this.system.container.getBoundingClientRect();
 
         // 获取该节点该侧的pad
@@ -186,28 +196,24 @@ class Node {
 
         const padRect = pad.getBoundingClientRect();
 
-        let x, y;
+        // 连接点 = pad 中心 + 沿「该侧实际朝向（已按旋转映射）」外推半个引脚半径。
+        // 用旋转映射后的方向向量，而非 pad 矩形边缘：旋转后矩形边缘是斜的，
+        // 取边缘会偏到斜向；取中心+方向外推，端点始终落在 pad 朝外侧的正中、方向正确。
+        const padCx = padRect.left + padRect.width / 2 - containerRect.left;
+        const padCy = padRect.top + padRect.height / 2 - containerRect.top;
 
-        switch (side) {
-            case 'top':
-                x = padRect.left + padRect.width / 2 - containerRect.left;
-                y = rect.top - containerRect.top;
-                break;
-            case 'right':
-                x = rect.left + rect.width - containerRect.left;
-                y = padRect.top + padRect.height / 2 - containerRect.top;
-                break;
-            case 'bottom':
-                x = padRect.left + padRect.width / 2 - containerRect.left;
-                y = rect.top + rect.height - containerRect.top;
-                break;
-            case 'left':
-                x = rect.left - containerRect.left;
-                y = padRect.top + padRect.height / 2 - containerRect.top;
-                break;
-        }
+        // 该侧在旋转后的实际屏幕朝向 -> 单位方向向量（指向节点外侧）
+        const effDir = this.getEffectivePortDir(side);
+        let ux = 0, uy = 0;
+        if (effDir === 'top') { ux = 0; uy = -1; }
+        else if (effDir === 'bottom') { ux = 0; uy = 1; }
+        else if (effDir === 'left') { ux = -1; uy = 0; }
+        else { ux = 1; uy = 0; } // right
 
-        return { x, y };
+        // 半个引脚（pad）外伸半径：取 pad 在对应轴向上的半长（旋转后用外接半宽近似）
+        const r = Math.max(padRect.width, padRect.height) / 2;
+
+        return { x: padCx + ux * r, y: padCy + uy * r };
     }
 
     // 获取所有连接到此节点的连接
@@ -234,6 +240,12 @@ class Node {
             this.element.style.left = `${x}px`;
             this.element.style.top = `${y}px`;
         }
+    }
+
+    // 设置旋转角度（度），R 键用于 90° 步进旋转器件，方便布局
+    setRotation(deg) {
+        this.rotation = ((deg % 360) + 360) % 360;
+        if (this.system) this.system.applyNodeTransform(this);
     }
 
     // 更新节点文本
@@ -399,19 +411,22 @@ class Node {
     }
 
     /**
-     * 聚合某 GPIO 端口（x = A~C）四个寄存器的当前 32 位值（来自各引脚 ioRegs）。
-     * 位域：MODE/PUPD 2bit/pin @[2y+1:2y]；OTYPE 1bit/pin @[y]；AFL 4bit/pin @[4y+3:4y]。
+     * 聚合某 GPIO 端口（x = A~F）四个寄存器的当前 32 位值（来自各引脚 ioRegs）。
+     * 位域：MODE/PUPD 2bit/pin @[2y+1:2y]；OTYPE 1bit/pin @[y]；
+     *       AFL 4bit/pin @[4y+3:4y]（pin 0~7，低 8 个 IO）；
+     *       AFH 4bit/pin @[4(y-8)+3:4(y-8)]（pin 8~15，高 8 个 IO）。
      * 仅遍历该端口实际存在的引脚（config 中 entry.port 形如 "PA0"），未配置引脚贡献 0。
+     * 返回 { MODE, OTYPE, PUPD, AFL, AFH }（兼容旧调用：仍以 AFL 表示低 8 位，新增 AFH 高 8 位）。
      */
     getPortRegisterValues(portLetter) {
         const L = (portLetter || '').toUpperCase();
-        const val = { MODE: 0, OTYPE: 0, PUPD: 0, AFL: 0 };
+        const val = { MODE: 0, OTYPE: 0, PUPD: 0, AFL: 0, AFH: 0 };
         if (!this.config || !this.config.device) return val;
         for (const s of ['top', 'right', 'bottom', 'left']) {
             const list = this.config[s] || [];
             list.forEach((entry, i) => {
                 if (!entry || typeof entry !== 'object' || !entry.port) return;
-                const pl = (entry.port.replace(/[^A-C]/gi, '') || '').toUpperCase();
+                const pl = (entry.port.replace(/[^A-F]/gi, '') || '').toUpperCase();
                 if (pl !== L) return;
                 const y = parseInt(entry.port.replace(/\D/g, ''), 10);
                 if (isNaN(y) || y < 0 || y > 15) return;
@@ -420,7 +435,8 @@ class Node {
                 val.OTYPE |= ((regs.otype & 0x1) << y);
                 val.PUPD  |= ((regs.pupd & 0x3) << (y * 2));
                 const afl = (regs.afl == null) ? 0 : (regs.afl & 0xF);
-                val.AFL   |= (afl << (y * 4));
+                if (y < 8) val.AFL |= (afl << (y * 4));
+                else       val.AFH |= (afl << ((y - 8) * 4));
             });
         }
         return val;
@@ -434,7 +450,7 @@ class Node {
      */
     getPortResetValues(portLetter) {
         const L = (portLetter || '').toUpperCase();
-        const val = { MODE: 0, OTYPE: 0, PUPD: 0, AFL: 0 };
+        const val = { MODE: 0, OTYPE: 0, PUPD: 0, AFL: 0, AFH: 0 };
         const dev = this.config && this.config.device;
         if (!dev || !dev.gpio || !dev.gpio.reset) return val;
         const reset = dev.gpio.reset;
@@ -443,7 +459,7 @@ class Node {
             const list = this.config[s] || [];
             list.forEach((entry, i) => {
                 if (!entry || typeof entry !== 'object' || !entry.port) return;
-                const pl = (entry.port.replace(/[^A-C]/gi, '') || '').toUpperCase();
+                const pl = (entry.port.replace(/[^A-F]/gi, '') || '').toUpperCase();
                 if (pl !== L) return;
                 const y = parseInt(entry.port.replace(/\D/g, ''), 10);
                 if (isNaN(y) || y < 0 || y > 15) return;
@@ -451,10 +467,12 @@ class Node {
                 const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? hxv(reset.PUPD[L])  : 0;
                 const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? hxv(reset.OTYPE[L]) : 0;
                 const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? hxv(reset.AFL[L])   : 0;
+                const rAfh   = (reset.AFH   && reset.AFH[L]   != null) ? hxv(reset.AFH[L])   : 0;
                 val.MODE  |= (((rMode  >> (y * 2)) & 0x3) << (y * 2));
                 val.OTYPE |= (((rOtype >> y) & 0x1) << y);
                 val.PUPD  |= (((rPupd  >> (y * 2)) & 0x3) << (y * 2));
-                val.AFL   |= (((rAfl   >> (y * 4)) & 0xF) << (y * 4));
+                if (y < 8) val.AFL |= (((rAfl >> (y * 4)) & 0xF) << (y * 4));
+                else       val.AFH |= (((rAfh >> ((y - 8) * 4)) & 0xF) << ((y - 8) * 4));
             });
         }
         return val;
@@ -472,7 +490,7 @@ class Node {
         if (!dev || !dev.gpio || !dev.gpio.reset) return def;
         const entry = this.config[side] && this.config[side][index];
         if (!entry || typeof entry !== 'object' || !entry.port) return def;
-        const L = (entry.port.replace(/[^A-C]/gi, '') || '').toUpperCase();
+        const L = (entry.port.replace(/[^A-F]/gi, '') || '').toUpperCase();
         const y = parseInt(entry.port.replace(/\D/g, ''), 10);
         if (isNaN(y) || y < 0 || y > 15) return def;
         const reset = dev.gpio.reset;
@@ -480,12 +498,18 @@ class Node {
         const rMode  = (reset.MODE  && reset.MODE[L]  != null) ? hxv(reset.MODE[L])  : 0;
         const rPupd  = (reset.PUPD  && reset.PUPD[L]  != null) ? hxv(reset.PUPD[L])  : 0;
         const rOtype = (reset.OTYPE && reset.OTYPE[L] != null) ? hxv(reset.OTYPE[L]) : 0;
-        const rAfl   = (reset.AFL   && reset.AFL[L]   != null) ? hxv(reset.AFL[L])   : 0;
+        if (y < 8) {
+            const rAfl = (reset.AFL && reset.AFL[L] != null) ? hxv(reset.AFL[L]) : 0;
+            def.afl = (rAfl >> (y * 4)) & 0xF;
+        } else {
+            const rAfh = (reset.AFH && reset.AFH[L] != null) ? hxv(reset.AFH[L]) : 0;
+            def.afl = (rAfh >> ((y - 8) * 4)) & 0xF;
+        }
         return {
             mode:  (rMode  >> (y * 2)) & 0x3,
             pupd:  (rPupd  >> (y * 2)) & 0x3,
             otype: (rOtype >> y) & 0x1,
-            afl:   (rAfl   >> (y * 4)) & 0xF
+            afl:   def.afl
         };
     }
 
@@ -557,7 +581,7 @@ class Node {
 
         if (func) {
             const label = func.label || func.id;
-            pad.innerHTML = label;
+            pad.innerHTML = '<span class="pin-label">' + label + '</span>';
             const extra = func.group ? ` [${func.group}]` : '';
             const pinTxt = pinNum != null ? `Pin ${pinNum}` : '';
             const portTxt = portName ? ` · ${portName}` : '';
@@ -566,7 +590,7 @@ class Node {
             this._fitPinFont(pad, label);
         } else {
             const base = pad.dataset.baseLabel || (pinNum != null ? pinNum : '');
-            pad.innerHTML = base;
+            pad.innerHTML = '<span class="pin-label">' + base + '</span>';
             const pinTxt = pinNum != null ? `Pin ${pinNum}` : '';
             const portTxt = portName ? ` · ${portName}` : '';
             pad.title = `${pinTxt}${portTxt}` || base;
@@ -675,6 +699,7 @@ class Node {
             nodeId: this.nodeId,
             config: this.config,
             position: { ...this.position },
+            rotation: this.rotation || 0,
             disabledPads: Array.from(this.disabledPads),
             af: afArr,
             ioRegs: ioRegsArr
@@ -684,6 +709,8 @@ class Node {
     // 从序列化数据还原节点
     static deserialize(data, system) {
         const node = new Node(data.config, data.position.x, data.position.y, data.nodeId, system);
+        // 恢复旋转角度
+        if (data.rotation) node.rotation = ((data.rotation % 360) + 360) % 360;
         // 恢复禁用的Pad
         (data.disabledPads || []).forEach(padKey => {
             const [side, index] = padKey.split('-');

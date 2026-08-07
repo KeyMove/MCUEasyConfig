@@ -28,6 +28,52 @@ document.addEventListener('DOMContentLoaded', function () {
     // 启动时把旧版「单一混合收藏夹」按定义结构分流为 MCU 设备 / 外设两个独立收藏夹（仅一次）
     migrateFavorites();
 
+    // 启动同步：把「MCU 设备收藏夹」合并进 APP_CONFIG.devices，使刷新页面后
+    // 「设备」下拉框（预制设备）里仍能看到并使用之前保存的自定义 MCU。
+    syncFavoritesToDevices();
+
+    // 把「MCU 设备收藏夹」合并进 APP_CONFIG.devices。
+    // 抽成独立函数：config.js 每次 applyConfig 都会整体重建 APP_CONFIG（丢弃我们合并的收藏夹设备），
+    // 因此需在每次 appconfigready 时重新执行，保证刷新页面后自定义 MCU 始终出现在「设备」下拉框。
+    // 把一个 MCU 定义（含完整 packages 数组）摊平进 APP_CONFIG.devices：
+    // 每个封装生成一个条目，key/显示名为 packages[i].name（与 config.js normalizeConfig 一致），
+    // 使「预制设备」下拉框按封装数量列出，且选中后 addDevice 能取到完整定义生成全部封装。
+    // 把一个 MCU 定义（含完整 packages 数组）摊平进 APP_CONFIG.devices：
+    // 只注册各封装条目（key/显示名 = packages[i].name），不注册 MCU 名本身——
+    // 能放进面板的只有封装，所以「预制设备」下拉只列封装。每个封装条目携带完整
+    // 共享定义（af/special/gpio），选中后 addDevice 只生成该封装节点。
+    function injectMcuDef(def) {
+        if (!def || !def.name) return;
+        if (!window.APP_CONFIG) window.APP_CONFIG = { devices: {}, peripherals: {} };
+        if (!window.APP_CONFIG.devices) window.APP_CONFIG.devices = {};
+        const devs = window.APP_CONFIG.devices;
+        (Array.isArray(def.packages) ? def.packages : []).forEach(pkg => {
+            const id = pkg.name || pkg.id || def.name;
+            if (!id) return;
+            devs[id] = {
+                name: id,
+                packageType: pkg.packageType || pkg.pkg || 'SOP',
+                pins: Array.isArray(pkg.pins) ? pkg.pins : [],
+                af: def.af || null,
+                special: def.special || null,
+                gpio: def.gpio || null,
+                mcu: def.name
+            };
+        });
+    }
+
+    function syncFavoritesToDevices() {
+        try {
+            const mcuFavs = loadFavorites('mcu');
+            if (!mcuFavs || !Object.keys(mcuFavs).length) return;
+            if (!window.APP_CONFIG) window.APP_CONFIG = { devices: {}, peripherals: {} };
+            if (!window.APP_CONFIG.devices) window.APP_CONFIG.devices = {};
+            Object.keys(mcuFavs).forEach(n => {
+                injectMcuDef(mcuFavs[n]);
+            });
+        } catch (e) {}
+    }
+
     // 注入 AF 右键菜单管理器（依赖 RichMenu / packages.js）
     nodeSystem.afManager = new AFManager(nodeSystem);
 
@@ -271,13 +317,15 @@ document.addEventListener('DOMContentLoaded', function () {
                 { title: '封装类型', controls: [
                     { type: 'button', id: 'genSOP', label: '生成 SOP', onClick: () => nodeSystem.addPackage('SOP', clampPins(dockMenu.menuControls['pins'].value)) },
                     { type: 'button', id: 'genLQFP', label: '生成 LQFP', onClick: () => nodeSystem.addPackage('LQFP', clampPins(dockMenu.menuControls['pins'].value)) },
-                    { type: 'button', id: 'genQFN', label: '生成 QFN', onClick: () => nodeSystem.addPackage('QFN', clampPins(dockMenu.menuControls['pins'].value)) }
+                    { type: 'button', id: 'genQFN', label: '生成 QFN', onClick: () => nodeSystem.addPackage('QFN', clampPins(dockMenu.menuControls['pins'].value)) },
+                    { type: 'button', id: 'genSIP', label: '生成 SIP', onClick: () => nodeSystem.addPackage('SIP', clampPins(dockMenu.menuControls['pins'].value)) }
                 ] }
             ]
         };
     }
 
     function devMenuCfg() {
+        syncFavoritesToDevices();   // 兜底：打开设备菜单时确保收藏夹设备已合并进 APP_CONFIG.devices
         const names = listDevices();
         return {
             title: '设备',
@@ -304,7 +352,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // 把 AF 表 { "PA0": ["-","SPI1_SCK",...] } 转成多行文本：
-    //   每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，'-' 表示无功能）
+    //   每行：<PORT> <AF0> <AF1> ... <AF15>（空格分隔，'-' 表示无功能）
     function afToText(af) {
         const lines = [];
         Object.keys(af || {}).forEach(port => {
@@ -340,7 +388,11 @@ document.addEventListener('DOMContentLoaded', function () {
         return pins;
     }
 
-    // 解析「AF」多行文本 → { "PORT": ["AF0".."AF7"] }
+    // AF（复用功能）最大数量：单 GPIO 端口最多 16 个引脚，对应 AF0..AF15。
+    // 低 8 个 IO（pin0~7）写入 AFL 寄存器，高 8 个 IO（pin8~15）写入 AFH 寄存器。
+    const AF_COUNT_MAX = 16;
+
+    // 解析「AF」多行文本 → { "PORT": ["AF0".."AF15"] }（短表按 '-' 补齐到 AF_COUNT_MAX）
     function parseAfText(text) {
         const af = {};
         (text || '').split('\n').forEach(raw => {
@@ -350,8 +402,8 @@ document.addEventListener('DOMContentLoaded', function () {
             const port = parts[0];
             if (!port) return;
             const funcs = parts.slice(1).map(v => (v === '-' || v === '' ? '-' : v));
-            while (funcs.length < 8) funcs.push('-');   // 补齐到 8 个 AF
-            af[port] = funcs.slice(0, 8);
+            while (funcs.length < AF_COUNT_MAX) funcs.push('-');   // 补齐到 16 个 AF
+            af[port] = funcs.slice(0, AF_COUNT_MAX);
         });
         return af;
     }
@@ -389,7 +441,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 packages: [
                     { name: 'SOP16', packageType: 'SOP', pins: 'PA0 PA0\nPA1 PA1\nPB0 PB0\nVSS\nVDD' }
                 ],
-                af: 'PA0 - SPI1_SCK - - - - - -\nPA1 - SPI1_MOSI - - - - - -',
+                af: 'PA0 - SPI1_SCK - - - - - - - SPI2_MISO - - - - - -\nPA1 - SPI1_MOSI - - - - - - - SPI2_MOSI - - - - - -',
                 special: 'PA0 ADC_IN0\nPA1 ADC_IN1',
                 gpio: {}
             };
@@ -433,7 +485,7 @@ document.addEventListener('DOMContentLoaded', function () {
         // '@pins' 为末级通配：packages 数组里每个元素的 pins 字段都套用相同样式。
         schema = {
             '@pins':   { type: 'textarea', rows: 10, placeholder: '每行一个引脚：<标签> [<port>]\n例：PA0 PA0\nVSS（无 port 可省略）' },
-            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，- 表示无）\n例：PA0 - SPI1_SCK - - - - - -' },
+            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF15>（空格分隔，- 表示无；pin0~7→AFL，pin8~15→AFH）\n例：PA0 - SPI1_SCK - - - - - - - SPI2_MISO - - - - - -' },
             '["special"]': { type: 'textarea', rows: 6,  placeholder: '每行：<PORT> <功能1> <功能2> ...（空格分隔）\n例：PA0 ADC_IN0' }
         };
         return { data, schema };
@@ -448,6 +500,34 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         if (typeof out.af === 'string') out.af = parseAfText(out.af);
         if (typeof out.special === 'string') out.special = parseSpecialText(out.special);
+        return out;
+    }
+
+    // 反向转换：把「结构化 obj 形态」定义（收藏夹里存的格式）转回编辑器期望的「文本形态」，
+    // 供「载入」编辑时回填，避免第一次输入的是文本、第二次打开却看到一堆 [object Object]。
+    // 仅处理编辑器用 textarea 编辑的字段（pins / af / special）；gpio 复位值统一显示 16 进制字符串。
+    function deviceObjToEditorText(def) {
+        const out = JSON.parse(JSON.stringify(def));
+        if (Array.isArray(out.packages)) {
+            out.packages.forEach(pkg => {
+                if (Array.isArray(pkg.pins)) pkg.pins = pinsToText(pkg.pins);   // obj → 文本
+                if (pkg.packageType == null && pkg.pkg != null) pkg.packageType = pkg.pkg;
+            });
+        }
+        if (out.af && typeof out.af !== 'string') out.af = afToText(out.af);            // obj → 文本
+        if (out.special && typeof out.special !== 'string') out.special = specialToText(out.special);
+        // gpio 复位值：保持 16 进制字符串显示（与 defaultDeviceSkeleton 一致），兼容数字
+        if (out.gpio && out.gpio.reset) {
+            ['MODE', 'OTYPE', 'PUPD', 'AFL'].forEach(reg => {
+                const tbl = out.gpio.reset[reg];
+                if (tbl && typeof tbl === 'object') {
+                    Object.keys(tbl).forEach(letter => {
+                        const v = tbl[letter];
+                        if (typeof v === 'number') tbl[letter] = '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
+                    });
+                }
+            });
+        }
         return out;
     }
 
@@ -480,7 +560,7 @@ document.addEventListener('DOMContentLoaded', function () {
         // 若 def 自带文本字段（pins/af/special 为字符串）但无 schema，补上默认文本 schema
         const editorSchema = skeleton.schema || {
             '@pins':   { type: 'textarea', rows: 10, placeholder: '每行一个引脚：<标签> [<port>]\n例：PA0 PA0\nVSS（无 port 可省略）' },
-            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF7>（空格分隔，- 表示无）\n例：PA0 - SPI1_SCK - - - - - -' },
+            '["af"]':      { type: 'textarea', rows: 10, placeholder: '每行：<PORT> <AF0> <AF1> ... <AF15>（空格分隔，- 表示无；pin0~7→AFL，pin8~15→AFH）\n例：PA0 - SPI1_SCK - - - - - - - SPI2_MISO - - - - - -' },
             '["special"]': { type: 'textarea', rows: 6,  placeholder: '每行：<PORT> <功能1> <功能2> ...（空格分隔）\n例：PA0 ADC_IN0' }
         };
 
@@ -574,21 +654,41 @@ document.addEventListener('DOMContentLoaded', function () {
             win.destroy();
         }));
         bar.appendChild(mkBtn('存为收藏', 'success', () => {
-            const def = editor.getObj();
-            if (!def || !def.name) { alert('请填写设备名称（name）'); return; }
+            const raw = editor.getObj();
+            if (!raw || !raw.name) { alert('请填写设备名称（name）'); return; }
+            // 保存时即完成 text → obj 重建（pins/af/special 文本解析回结构化），
+            // 保证收藏夹里存的是可直接使用的定义，后续注入/生成都无需再做文本兜底。
+            const def = parseDeviceEditorText(raw);
             def.svdKey = currentSvdKey;   // 显式绑定 SVD（'__auto__' 表示按型号自动匹配）
             def.kind = 'mcu';             // 设备编辑器定义一律归入 MCU 设备收藏夹
             const favs = loadFavorites('mcu');
             favs[def.name] = def; saveFavorites(favs, 'mcu');
             refreshFavSel();
-            nodeSystem.updateConnectionStatus('已加入收藏', '#38bdf8', `设备「${def.name}」已存入收藏夹`);
+            // 同时注册进 APP_CONFIG.devices：按 packages 数组摊平，每个封装（name）成为一条「预制设备」下拉项
+            injectMcuDef(def);
+            // 原地刷新「设备」下拉框，避免保存后还需重开面板
+            if (dockMenu && dockMenu.menuControls && dockMenu.menuControls['device']) {
+                const sel = dockMenu.menuControls['device'];
+                const cur = sel.value;
+                const names = listDevices();
+                sel.innerHTML = '';
+                names.forEach(n => {
+                    const op = document.createElement('option');
+                    op.value = n; op.textContent = n;
+                    if (n === cur) op.selected = true;
+                    sel.appendChild(op);
+                });
+            }
+            nodeSystem.updateConnectionStatus('已加入收藏', '#38bdf8', `设备「${def.name}」已存入收藏夹，并加入「设备」下拉`);
         }));
         bar.appendChild(mkBtn('载入', 'secondary', () => {
             const name = favSel.value;
             if (!name) { alert('请先在收藏夹下拉选择设备'); return; }
             const def = loadFavorites('mcu')[name];
             if (!def) return;
-            editor.setObj(JSON.parse(JSON.stringify(def)), editorSchema);
+            // 反向转换：收藏里是 obj 形态（pins 数组 / af / special 数组），
+            // 需转回编辑器期望的文本形态再回填，否则 textarea 会显示成 [object Object]。
+            editor.setObj(deviceObjToEditorText(def), editorSchema);
             // 同步该设备显式绑定的 SVD key
             currentSvdKey = (def && def.svdKey) ? def.svdKey : '__auto__';
             refreshSvdSel();
@@ -1443,7 +1543,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // 已知总线前缀正则已收编进 config（window.APP_SIGNAL_CONFIG.knownBusRe），运行时动态读取。
     const POWER_RE = /^(VDD|VSS|VCC|GND|VBAT|NC)$/i;
     // 已知封装类型：第 1 行第 2 个 token 命中才视为“封装”，否则当作接口名（以支持省略封装）
-    const KNOWN_PKG = /^(SOP|DIP|QFN|LQFP|TSSOP|SOIC|BGA|QFP|PLCC|DFN|MSOP|SOT\d*|TO\d*|TSOP|SSOP|VQFN|HVQFN)$/i;
+    const KNOWN_PKG = /^(SOP|DIP|QFN|LQFP|TSSOP|SOIC|BGA|QFP|PLCC|DFN|MSOP|SOT\d*|TO\d*|TSOP|SSOP|VQFN|HVQFN|SIP)$/i;
     function parseDeviceDef(text) {
         const lines = (text || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
         if (!lines.length) return null;
@@ -2580,6 +2680,10 @@ int main(void){
         // 暴露全局 dock 实例，供其它模块（如面板工作台）追加图标
         window.__dock = new MacOSDock(dockHost, dockItems, { position: 'top', scaleFactor: 0.5 });
     }
+    // config.js 每次 applyConfig 会整体重建 APP_CONFIG，丢弃已合并的收藏夹设备。
+    // 故每次 appconfigready 重新同步一次，确保自定义 MCU 始终出现在「设备」下拉框。
+    window.addEventListener('appconfigready', syncFavoritesToDevices);
+
     } // end boot()
 
     // 配置就绪后立即启动；若仍加载中（http fetch 异步），监听 appconfigready 后再启动。

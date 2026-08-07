@@ -465,6 +465,21 @@
         line-height: 1;
     }
     .node-port.pin::after { display: none !important; }
+    /* 引脚文字：默认横向居中；四边出 pin 时，顶/底引脚为竖向矩形，
+       文字旋转 90° 沿引脚长轴排布，长名称不再横向挤在一起。 */
+    .node-port.pin .pin-label {
+        display: inline-block;
+        transform-origin: center center;
+        max-width: 100%;
+        overflow: visible;
+        text-overflow: clip;
+    }
+    .node-port.pin.port-top .pin-label {
+        transform: rotate(-90deg);
+    }
+    .node-port.pin.port-bottom .pin-label {
+        transform: rotate(90deg);
+    }
     .node-port.pin.port-top {
         top: -17px; transform: translateX(-50%);
         width: 18px; height: 34px;

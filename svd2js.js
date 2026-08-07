@@ -149,14 +149,37 @@ function convert(svdText, sfdText) {
   const peripherals = {};
   const peripheralsEl = child(device, 'peripherals');
   if (peripheralsEl) {
-    for (const per of childrenNamed(peripheralsEl, 'peripheral')) {
+    // 第一遍：先收集所有 peripheral 节点（含顺序），便于处理 derivedFrom 继承
+    const perNodes = childrenNamed(peripheralsEl, 'peripheral');
+    for (const per of perNodes) {
       const pname = childText(per, 'name');
       if (!pname) continue;
       const base = parseInt(childText(per, 'baseAddress'), 16);
       const group = (childText(per, 'groupName') || '').trim() || pname;
       const desc = childText(per, 'description');
+      const derived = per.attrs.derivedFrom;
 
       const registers = {};
+
+      // derivedFrom: 从已解析的父外设克隆寄存器定义（深拷贝），
+      // 字段/偏移与父一致，绝对地址后续按本外设 base 重新计算（SFD 优先）。
+      if (derived && peripherals[derived]) {
+        const srcRegs = peripherals[derived].registers;
+        for (const d of Object.keys(srcRegs)) {
+          const src = srcRegs[d];
+          registers[d] = {
+            name: src.name,
+            addressOffset: src.addressOffset,
+            address: base + src.addressOffset,
+            size: src.size,
+            access: src.access,
+            resetValue: src.resetValue,
+            // 深拷贝 fields，避免共享引用
+            fields: JSON.parse(JSON.stringify(src.fields))
+          };
+        }
+      }
+
       const regsEl = child(per, 'registers');
       if (regsEl) {
         for (const reg of childrenNamed(regsEl, 'register')) {

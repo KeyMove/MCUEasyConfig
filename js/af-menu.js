@@ -45,7 +45,7 @@ class AFManager {
 
         // 是否为预制设备引脚
         const isDevice = !!(node.config && node.config.device);
-        // 设备引脚的 AF 复用表（PORT -> [AF0..AF7]）
+        // 设备引脚的 AF 复用表（PORT -> [AF0..AF15]，最多 16 个复用功能）
         const devAf = (isDevice && portName && node.config.device.af[portName])
             ? node.config.device.af[portName]
             : null;

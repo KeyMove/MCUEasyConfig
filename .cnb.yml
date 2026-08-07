@@ -1,0 +1,13 @@
+$:
+  vscode:
+    clouddev:
+      docker:
+        build: .ide/Dockerfile
+        devcontainer: .devcontainer/devcontainer.json
+        image: cnbcool/default-dev-env
+      runner:
+        cpus: 2
+        memory: 4GiB
+      services:
+        - vscode
+        - docker

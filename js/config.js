@@ -34,7 +34,8 @@
           "MODE": "0x00",
           "OTYPE": "0x04",
           "PUPD": "0x0C",
-          "AFL": "0x20"
+          "AFL": "0x20",
+          "AFH": "0x24"
         },
         "reset": {
           "MODE": {
@@ -53,6 +54,11 @@
             "C": "0x00000000"
           },
           "AFL": {
+            "A": "0x00000000",
+            "B": "0x00000000",
+            "C": "0x00000000"
+          },
+          "AFH": {
             "A": "0x00000000",
             "B": "0x00000000",
             "C": "0x00000000"
@@ -1126,7 +1132,7 @@
         "CH4"
       ]
     },
-    "knownBus": "SPI|I2C|UART|USART|TIM|CAN|SDIO|QUADSPI"
+    "knownBus": "SPI|I2C|UART|USART|TIM|CAN|SDIO|QUADSPI|IR_OUT"
   }
 };
     window.APP_BASE_CONFIG = BASE;
